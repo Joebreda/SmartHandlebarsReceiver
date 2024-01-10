@@ -28,11 +28,22 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ListView;
+import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -49,10 +60,21 @@ public class MainActivity extends AppCompatActivity {
     private ArrayAdapter<String> mDeviceListAdapter;  // List of strings to display on the screen.
     private ListView mDeviceListView;
     private boolean currentlyScanning = false;
-    private boolean newFrame = false;
     private int[] frame = new int[8*8];
     private int pixel_index = 0;
     private int changeCounter = 0;
+    private String formattedDateTime;
+    private File output_file;
+    //private ByteBuffer buffer = ByteBuffer.allocate(64 * 2); // Each integer is 2 bytes
+    private final Object fileLock = new Object();
+    private ConcurrentLinkedQueue<Byte> dataQueue = new ConcurrentLinkedQueue<>();
+    private Thread fileWritingThread;
+    private TextView textView;
+    private volatile boolean keepRunning = true;
+    DateTimeFormatter formatter;
+    private int frame_mean = 0;
+
+
 
     private static final int MULTIPLE_PERMISSIONS_REQUEST_CODE = 123;
 
@@ -72,6 +94,88 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    public void updateTextView(String toThis) {
+        TextView textView = (TextView) findViewById(R.id.textView);
+        textView.setText(toThis);
+    }
+
+    private void writeBufferToFile(ByteBuffer buffer) {
+        StringBuilder csvLine = new StringBuilder();
+        long timestamp = System.currentTimeMillis();
+        csvLine.append(timestamp);
+        frame_mean = 0;
+
+        while (buffer.hasRemaining()) {
+            int value = buffer.getShort() & 0xFFFF;
+            frame_mean = frame_mean + value;
+            csvLine.append(",").append(value);
+        }
+        frame_mean = frame_mean / 64;
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                // Update your TextView here
+                textView.setText(frame_mean + "");
+            }
+        });
+
+        try (BufferedWriter bw = new BufferedWriter(new FileWriter(output_file, true))) {
+            bw.write(csvLine.toString());
+            bw.newLine();
+        } catch (IOException e) {
+            // Handle IOException
+        }
+    }
+
+    private synchronized boolean isFileWritingThreadRunning() {
+        return fileWritingThread != null && fileWritingThread.isAlive();
+    }
+
+    private synchronized void startFileWritingThread() {
+        if (isFileWritingThreadRunning()) {
+            return; // The thread is already running
+        }
+        keepRunning = true;
+
+        fileWritingThread = new Thread(() -> {
+            ByteBuffer buffer = ByteBuffer.allocate(64 * 2); // Adjust size as needed
+            while (keepRunning) {
+                while (!dataQueue.isEmpty()) {
+                    buffer.put(dataQueue.poll());
+
+                    if (buffer.position() >= 64 * 2) {
+                        buffer.flip(); // Prepare for reading from the buffer
+                        writeBufferToFile(buffer);
+                        buffer.clear();
+                    }
+                }
+
+                // Optional: Sleep a bit if queue is empty to reduce CPU usage
+                try {
+                    Thread.sleep(10); // Sleep for 10 milliseconds
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+
+        fileWritingThread.start();
+    }
+
+    private synchronized void stopFileWritingThread() {
+        if (!isFileWritingThreadRunning()) {
+            return; // The thread is not running
+        }
+        keepRunning = false;
+        fileWritingThread.interrupt();
+        try {
+            fileWritingThread.join(); // Wait for the thread to finish
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        fileWritingThread = null; // Clear the thread reference
+    }
+
     private final BluetoothGattCallback mGattCallback = new BluetoothGattCallback() {
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
@@ -82,11 +186,38 @@ public class MainActivity extends AppCompatActivity {
                     handlePermissionsNotGranted(Manifest.permission.BLUETOOTH_CONNECT);
                     return;
                 }
+
+                // Request larger MTU size
+                //gatt.requestMtu(260);
+
+                // Create a new output file to write to each time you reconnection.
+                LocalDateTime now = LocalDateTime.now();
+                formattedDateTime = now.format(formatter);
+                String filename = getExternalFilesDir(null) + "/" + formattedDateTime + ".csv";
+                Log.i("FILEPATH:", filename + "");
+                output_file = new File(filename);
+                frame_mean = 0;
+
+                if (!isFileWritingThreadRunning()) {
+                    startFileWritingThread();
+                }
                 mBluetoothGatt.discoverServices();
                 Log.i("BLE", "Attempting to start service discovery");
 
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.i("BLE", "Disconnected from GATT server.");
+                stopFileWritingThread(); // Stop the file writing thread
+                dataQueue.clear(); // Clear the data queue
+            }
+        }
+
+        @Override
+        public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
+            super.onMtuChanged(gatt, mtu, status);
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.i("ON MTU CHANGE", "SUCCESS!!!!");
+            } else {
+                Log.i("ON MTU CHANGE", "FAILURE....");
             }
         }
 
@@ -106,6 +237,10 @@ public class MainActivity extends AppCompatActivity {
                             handlePermissionsNotGranted(Manifest.permission.BLUETOOTH_CONNECT);
                             return;
                         }
+                        // Clear buffer anytime the connection is remade.
+                        //buffer.clear();
+                        // Start thread to process received bluetooth data into a file.
+                        //startFileWritingThread();
                         gatt.setCharacteristicNotification(characteristic, true);
                         // Enabled remote notifications
                         BluetoothGattDescriptor desc = characteristic.getDescriptor(
@@ -125,24 +260,13 @@ public class MainActivity extends AppCompatActivity {
                                             BluetoothGattCharacteristic characteristic) {
             if (MY_CHARACTERISTIC_UUID.equals(characteristic.getUuid())) {
                 byte[] data = characteristic.getValue();
-                //Log.i("onCharacteristicChanged", "" + data.length + " " + changeCounter++);
-                // Flattened frame.
-                for (int i = 0; i < data.length; i+=2) {
-                    int pixel = ((data[i] & 0xFF) << 8) | (data[i+1] & 0xFF);
-                    frame[pixel_index] = pixel;
-                    pixel_index++;
-                    Log.i("pixel index", "" + pixel_index);
+                long timestamp = System.currentTimeMillis();
+                Log.i("Received data", "" + timestamp);
+                // Add received data to the queue
+                for (byte b : data) {
+                    dataQueue.offer(b);
                 }
 
-                if (data.length < 20) {
-                    newFrame = true;
-                    //int[] finishedFrame = new int[frame.length];
-                    printFrame(frame);
-                    frame = new int[8*8];
-                    pixel_index = 0;
-                }
-                //Log.i("data received", "" + data);
-                //Log.i("Data Received", "" + data.length);
             }
         }
     };
@@ -155,7 +279,7 @@ public class MainActivity extends AppCompatActivity {
                 Manifest.permission.BLUETOOTH_ADMIN,
                 Manifest.permission.BLUETOOTH_CONNECT,
                 Manifest.permission.BLUETOOTH_SCAN,
-                //Manifest.permission.WRITE_EXTERNAL_STORAGE
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
         };
 
         boolean allPermissionsGranted = true;
@@ -216,6 +340,11 @@ public class MainActivity extends AppCompatActivity {
         mDeviceListView = findViewById(R.id.deviceListView);
         mDeviceListView.setAdapter(mDeviceListAdapter);
         EditText searchEditText = findViewById(R.id.searchEditText);
+
+        LocalDateTime now = LocalDateTime.now();
+        // Format it to a human-readable string
+        formatter = DateTimeFormatter.ofPattern("dd-MM-yyyy_HH:mm:ss");
+        textView = (TextView) findViewById(R.id.textView);
 
         // Set up the TextWatcher
         searchEditText.addTextChangedListener(new TextWatcher() {
