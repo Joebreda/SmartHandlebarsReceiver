@@ -64,11 +64,17 @@ public class MainActivity extends AppCompatActivity {
     private int pixel_index = 0;
     private int changeCounter = 0;
     private String formattedDateTime;
-    private File output_file;
     //private ByteBuffer buffer = ByteBuffer.allocate(64 * 2); // Each integer is 2 bytes
     private final Object fileLock = new Object();
-    private ConcurrentLinkedQueue<Byte> dataQueue = new ConcurrentLinkedQueue<>();
-    private Thread fileWritingThread;
+    // Variables for controlling file writing for two output files.
+    private ConcurrentLinkedQueue<Integer> rearSensorDataQueue = new ConcurrentLinkedQueue<>();
+    private ConcurrentLinkedQueue<Integer> sideSensorDataQueue = new ConcurrentLinkedQueue<>();
+    private Thread rearSensorFileWritingThread;
+    private Thread sideSensorFileWritingThread;
+    private File rearSensorOutputFile;
+    private File sideSensorOutputFile;
+    private int restartCounter;
+
     private TextView textView;
     private volatile boolean keepRunning = true;
     DateTimeFormatter formatter;
@@ -99,16 +105,21 @@ public class MainActivity extends AppCompatActivity {
         textView.setText(toThis);
     }
 
-    private void writeBufferToFile(ByteBuffer buffer) {
+    private void writeBufferToFile(ByteBuffer buffer, File sensorOutputFile) {
         StringBuilder csvLine = new StringBuilder();
         long timestamp = System.currentTimeMillis();
         csvLine.append(timestamp);
         frame_mean = 0;
 
         while (buffer.hasRemaining()) {
-            int value = buffer.getShort() & 0xFFFF;
-            frame_mean = frame_mean + value;
-            csvLine.append(",").append(value);
+            short next = buffer.getShort();
+            if (next == (byte) '\n') {
+                csvLine.append("\n");
+            } else {
+                int value = next & 0xFFFF;
+                frame_mean = frame_mean + value;
+                csvLine.append(",").append(value);
+            }
         }
         frame_mean = frame_mean / 64;
         runOnUiThread(new Runnable() {
@@ -119,7 +130,8 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        try (BufferedWriter bw = new BufferedWriter(new FileWriter(output_file, true))) {
+        try (BufferedWriter bw = new BufferedWriter(
+                new FileWriter(sensorOutputFile,true))) {
             bw.write(csvLine.toString());
             bw.newLine();
         } catch (IOException e) {
@@ -127,27 +139,55 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private synchronized boolean isFileWritingThreadRunning() {
+    private void writeLineToFile(String line, File outputFile) {
+        try (BufferedWriter bw = new BufferedWriter(new FileWriter(outputFile, true))) {
+            bw.write(line);
+            bw.newLine();
+        } catch (IOException e) {
+            // Handle IOException
+        }
+    }
+
+    private synchronized boolean isFileWritingThreadRunning(Thread fileWritingThread) {
         return fileWritingThread != null && fileWritingThread.isAlive();
     }
 
-    private synchronized void startFileWritingThread() {
-        if (isFileWritingThreadRunning()) {
-            return; // The thread is already running
+    private synchronized Thread startFileWritingThread(Thread thread,
+                                                       ConcurrentLinkedQueue<Integer> queue,
+                                                       File outputFile,
+                                                       String threadName) {
+        // if thread is already running just return it.
+        if (isFileWritingThreadRunning(thread)) {
+            return thread;
+            //return; // The thread is already running
         }
         keepRunning = true;
 
-        fileWritingThread = new Thread(() -> {
-            ByteBuffer buffer = ByteBuffer.allocate(64 * 2); // Adjust size as needed
+        thread = new Thread(() -> {
+            StringBuilder csvLine = new StringBuilder();
             while (keepRunning) {
-                while (!dataQueue.isEmpty()) {
-                    buffer.put(dataQueue.poll());
-
-                    if (buffer.position() >= 64 * 2) {
-                        buffer.flip(); // Prepare for reading from the buffer
-                        writeBufferToFile(buffer);
-                        buffer.clear();
+                while (!queue.isEmpty()) {
+                    Log.i("ThreadName", threadName);
+                    Integer polledValue = queue.poll();
+                    int value = -999;
+                    if (polledValue != null) {
+                        value = polledValue.intValue();
+                        // Process the value
+                    } else {
+                        Log.i("in thread", "Queue.poll() was null....");
                     }
+
+                    if (value == Integer.MIN_VALUE) { // End of packet marker
+                        // Write the current line to file and start a new line
+                        writeLineToFile(csvLine.toString(), outputFile);
+                        csvLine = new StringBuilder();
+                        long timestamp = System.currentTimeMillis();
+                        csvLine.append(timestamp).append(",");
+                        continue;
+                    }
+
+                    // Append value to the CSV line
+                    csvLine.append(value).append(",");
                 }
 
                 // Optional: Sleep a bit if queue is empty to reduce CPU usage
@@ -157,23 +197,27 @@ public class MainActivity extends AppCompatActivity {
                     Thread.currentThread().interrupt();
                 }
             }
-        });
-
-        fileWritingThread.start();
+        }, threadName);
+        thread.start();
+        return thread;
     }
 
-    private synchronized void stopFileWritingThread() {
-        if (!isFileWritingThreadRunning()) {
-            return; // The thread is not running
+    private synchronized Thread stopFileWritingThread(Thread thread) {
+        if (!isFileWritingThreadRunning(thread)) {
+            return null; // The thread is not running
         }
         keepRunning = false;
-        fileWritingThread.interrupt();
+        thread.interrupt();
         try {
-            fileWritingThread.join(); // Wait for the thread to finish
+            thread.join(); // Wait for the thread to finish
+            Log.i("STOP THREAD", "thread joined.");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            Log.i("STOP THREAD", "Could not join thread.");
         }
-        fileWritingThread = null; // Clear the thread reference
+        // only necessary if returns void using global thread variable.
+        // thread = null; // Clear the thread reference
+        return null;
     }
 
     private final BluetoothGattCallback mGattCallback = new BluetoothGattCallback() {
@@ -193,22 +237,41 @@ public class MainActivity extends AppCompatActivity {
                 // Create a new output file to write to each time you reconnection.
                 LocalDateTime now = LocalDateTime.now();
                 formattedDateTime = now.format(formatter);
-                String filename = getExternalFilesDir(null) + "/" + formattedDateTime + ".csv";
-                Log.i("FILEPATH:", filename + "");
-                output_file = new File(filename);
+                String rearFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_rear.csv";
+                String sideFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_side.csv";
+                Log.i("FILEPATH:", rearFilename + "");
+                rearSensorOutputFile = new File(rearFilename);
+                sideSensorOutputFile = new File(sideFilename);
                 frame_mean = 0;
 
-                if (!isFileWritingThreadRunning()) {
-                    startFileWritingThread();
+                restartCounter++;
+
+                if (!isFileWritingThreadRunning(rearSensorFileWritingThread)) {
+                    //rearSensorFileWritingThread = startFileWritingThread(rearSensorFileWritingThread);
+                    startFileWritingThread(rearSensorFileWritingThread, rearSensorDataQueue,
+                            rearSensorOutputFile, "rearSensorThread" + restartCounter);
                 }
+                if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
+                    startFileWritingThread(sideSensorFileWritingThread, sideSensorDataQueue,
+                            sideSensorOutputFile, "sideSensorThread" + restartCounter);
+                }
+
                 mBluetoothGatt.discoverServices();
                 Log.i("BLE", "Attempting to start service discovery");
 
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.i("BLE", "Disconnected from GATT server.");
-                stopFileWritingThread(); // Stop the file writing thread
-                dataQueue.clear(); // Clear the data queue
+                stopThreads(); // Use synchronized wrapper to stop both threads.
+
             }
+        }
+
+        private synchronized void stopThreads() {
+            // Stop the file writing thread and reset the variable to null.
+            rearSensorFileWritingThread = stopFileWritingThread(rearSensorFileWritingThread);
+            rearSensorDataQueue.clear(); // Clear the data queue
+            sideSensorFileWritingThread = stopFileWritingThread(sideSensorFileWritingThread);
+            sideSensorDataQueue.clear(); // Clear the data queue
         }
 
         @Override
@@ -261,12 +324,52 @@ public class MainActivity extends AppCompatActivity {
             if (MY_CHARACTERISTIC_UUID.equals(characteristic.getUuid())) {
                 byte[] data = characteristic.getValue();
                 long timestamp = System.currentTimeMillis();
-                Log.i("Received data", "" + timestamp);
-                // Add received data to the queue
-                for (byte b : data) {
-                    dataQueue.offer(b);
+
+                int sensorIndex = data[0] & 0xFF;
+                int packetIndex = data[1] & 0xFF;
+                int firstPayloadInt = ((data[2] & 0xFF) << 8) | (data[3] & 0xFF);
+
+                Log.i("Received data",  "from sensor " + sensorIndex + " packet " + packetIndex + " at time " + timestamp);
+                Log.i("first payload value:", firstPayloadInt + " big endian");
+                Log.i("Packet length: ", data.length + "");
+                // Add received data to the respective queue
+                /*
+                if (sensorIndex == 1) {
+                    for (byte b : data) {
+                        rearSensorDataQueue.offer(b);
+                    }
+                    rearSensorDataQueue.offer((byte) '\n');
+                } else if (sensorIndex == 2) {
+                    for (byte b : data) {
+                        sideSensorDataQueue.offer(b);
+                    }
+                    sideSensorDataQueue.offer((byte) '\n');
+                }
+                */
+                // Assume data.length is always even and > 2 for simplicity
+                for (int i = 2; i < data.length; i += 2) {
+                    int value = ((data[i] & 0xFF) << 8) | (data[i+1] & 0xFF);
+                    if (sensorIndex == 1) {
+                        rearSensorDataQueue.offer(value);
+                    } else if (sensorIndex == 2) {
+                        sideSensorDataQueue.offer(value);
+                    }
                 }
 
+                // Optionally, add a special marker to indicate packet end
+                int endOfPacketMarker = Integer.MAX_VALUE; // or some other value that won't conflict with actual data
+                int endOfReading = Integer.MIN_VALUE;
+                if (sensorIndex == 1) {
+                    rearSensorDataQueue.offer(endOfPacketMarker - packetIndex);
+                    if (packetIndex == 1) {
+                        rearSensorDataQueue.offer(endOfPacketMarker - packetIndex);
+                    }
+                } else if (sensorIndex == 2) {
+                    sideSensorDataQueue.offer(endOfPacketMarker);
+                    if (packetIndex == 1) {
+                        sideSensorDataQueue.offer(endOfReading);
+                    }
+                }
             }
         }
     };
@@ -335,6 +438,7 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        restartCounter = 0;
         mDeviceList = new ArrayList<>();
         mDeviceListAdapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1);
         mDeviceListView = findViewById(R.id.deviceListView);
