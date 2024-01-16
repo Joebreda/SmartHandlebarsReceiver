@@ -18,7 +18,14 @@ import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.util.Log;
@@ -69,11 +76,17 @@ public class MainActivity extends AppCompatActivity {
     // Variables for controlling file writing for two output files.
     private ConcurrentLinkedQueue<Integer> rearSensorDataQueue = new ConcurrentLinkedQueue<>();
     private ConcurrentLinkedQueue<Integer> sideSensorDataQueue = new ConcurrentLinkedQueue<>();
-    private Thread rearSensorFileWritingThread;
-    private Thread sideSensorFileWritingThread;
+    private Thread rearSensorFileWritingThread = null;
+    private Thread sideSensorFileWritingThread = null;
     private File rearSensorOutputFile;
     private File sideSensorOutputFile;
     private int restartCounter;
+    private int print_frame_mean = 0;
+
+    private Sensor rotationSensor;
+    private Sensor accelerometer;
+    private Sensor gyroscope;
+    private Sensor magnetometer;
 
     private TextView textView;
     private volatile boolean keepRunning = true;
@@ -162,12 +175,13 @@ public class MainActivity extends AppCompatActivity {
             //return; // The thread is already running
         }
         keepRunning = true;
+        //Log.i("STARTING THREAD", "Starting thread: " + threadName);
 
         thread = new Thread(() -> {
             StringBuilder csvLine = new StringBuilder();
             while (keepRunning) {
                 while (!queue.isEmpty()) {
-                    Log.i("ThreadName", threadName);
+                    //Log.i("ThreadName", threadName);
                     Integer polledValue = queue.poll();
                     int value = -999;
                     if (polledValue != null) {
@@ -180,6 +194,7 @@ public class MainActivity extends AppCompatActivity {
                     if (value == Integer.MIN_VALUE) { // End of packet marker
                         // Write the current line to file and start a new line
                         writeLineToFile(csvLine.toString(), outputFile);
+                        //Log.i("ThreadName", threadName + "has data!");
                         csvLine = new StringBuilder();
                         long timestamp = System.currentTimeMillis();
                         csvLine.append(timestamp).append(",");
@@ -246,22 +261,30 @@ public class MainActivity extends AppCompatActivity {
 
                 restartCounter++;
 
-                if (!isFileWritingThreadRunning(rearSensorFileWritingThread)) {
-                    //rearSensorFileWritingThread = startFileWritingThread(rearSensorFileWritingThread);
-                    startFileWritingThread(rearSensorFileWritingThread, rearSensorDataQueue,
-                            rearSensorOutputFile, "rearSensorThread" + restartCounter);
-                }
                 if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
-                    startFileWritingThread(sideSensorFileWritingThread, sideSensorDataQueue,
+                    sideSensorFileWritingThread = startFileWritingThread(
+                            sideSensorFileWritingThread, sideSensorDataQueue,
                             sideSensorOutputFile, "sideSensorThread" + restartCounter);
                 }
+                if (!isFileWritingThreadRunning(rearSensorFileWritingThread)) {
+                    //rearSensorFileWritingThread = startFileWritingThread(rearSensorFileWritingThread);
+                    rearSensorFileWritingThread = startFileWritingThread(
+                            rearSensorFileWritingThread, rearSensorDataQueue,
+                            rearSensorOutputFile, "rearSensorThread" + restartCounter);
+                }
+
 
                 mBluetoothGatt.discoverServices();
                 Log.i("BLE", "Attempting to start service discovery");
 
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.i("BLE", "Disconnected from GATT server.");
-                stopThreads(); // Use synchronized wrapper to stop both threads.
+                // Stop the file writing thread and reset the variable to null.
+                rearSensorFileWritingThread = stopFileWritingThread(rearSensorFileWritingThread);
+                rearSensorDataQueue.clear(); // Clear the data queue
+                sideSensorFileWritingThread = stopFileWritingThread(sideSensorFileWritingThread);
+                sideSensorDataQueue.clear(); // Clear the data queue
+                closeGatt(); // Necessary to ensure only one bluetooth callback is registered at a time.
 
             }
         }
@@ -288,6 +311,8 @@ public class MainActivity extends AppCompatActivity {
         public void onServicesDiscovered(BluetoothGatt gatt, int status) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.i("BLE", "GATT SUCCESS, looking for correct service and characteristic.");
+                Button button = findViewById(R.id.scanButton);
+                button.setBackgroundColor(Color.parseColor("#00FF00")); // sets background color to red
                 // Loop through available GATT Services and find your specific service & characteristic
                 for (BluetoothGattService gattService : gatt.getServices()) {
                     if (gattService.getUuid().equals(MY_SERVICE_UUID)) {
@@ -329,9 +354,7 @@ public class MainActivity extends AppCompatActivity {
                 int packetIndex = data[1] & 0xFF;
                 int firstPayloadInt = ((data[2] & 0xFF) << 8) | (data[3] & 0xFF);
 
-                Log.i("Received data",  "from sensor " + sensorIndex + " packet " + packetIndex + " at time " + timestamp);
-                Log.i("first payload value:", firstPayloadInt + " big endian");
-                Log.i("Packet length: ", data.length + "");
+                Log.i("Received data",  "from sensor " + sensorIndex + " packet " + packetIndex + " at time " + timestamp + " first value was " + firstPayloadInt);
                 // Add received data to the respective queue
                 /*
                 if (sensorIndex == 1) {
@@ -361,11 +384,19 @@ public class MainActivity extends AppCompatActivity {
                 int endOfReading = Integer.MIN_VALUE;
                 if (sensorIndex == 1) {
                     rearSensorDataQueue.offer(endOfPacketMarker - packetIndex);
+                    // TODO update this in the case that there are more than 2 packets per reading.
                     if (packetIndex == 1) {
-                        rearSensorDataQueue.offer(endOfPacketMarker - packetIndex);
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                // Update your TextView here
+                                textView.setText(firstPayloadInt + "");
+                            }
+                        });
+                        rearSensorDataQueue.offer(endOfReading);
                     }
                 } else if (sensorIndex == 2) {
-                    sideSensorDataQueue.offer(endOfPacketMarker);
+                    sideSensorDataQueue.offer(endOfPacketMarker - packetIndex);
                     if (packetIndex == 1) {
                         sideSensorDataQueue.offer(endOfReading);
                     }
@@ -432,6 +463,26 @@ public class MainActivity extends AppCompatActivity {
         mDeviceListAdapter.addAll(filteredListNames);
         mDeviceListAdapter.notifyDataSetChanged();
     }
+   /*
+    public class rotationSensorListener implements SensorEventListener {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            // Process sensor data (e.g., write to a file)
+            writeSensorDataToFile(event);
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+            // Handle sensor accuracy changes if needed
+        }
+
+        private void writeSensorDataToFile(SensorEvent event) {
+            // Implement file writing logic here
+            // Use event.values for sensor data
+            // Use event.timestamp for the timestamp
+        }
+    }
+    */
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -449,6 +500,63 @@ public class MainActivity extends AppCompatActivity {
         // Format it to a human-readable string
         formatter = DateTimeFormatter.ofPattern("dd-MM-yyyy_HH:mm:ss");
         textView = (TextView) findViewById(R.id.textView);
+
+        /*
+        // Initialize the IMU sensors.
+        SensorManager mySensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
+
+        rotationSensor = mySensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+        if (rotationSensor != null) {
+            Log.i("SENSOR!", "Sensor.TYPE_ROTATION_VECTOR Available");
+            HandlerThread rotationSensorHandlerThread = new HandlerThread("RotationSensorThread");
+            rotationSensorHandlerThread.start();
+            Handler rotationSensorHandler = new Handler(rotationSensorHandlerThread.getLooper());
+            mySensorManager.registerListener(rotationSensorListener,
+                    rotationSensor, SensorManager.SENSOR_DELAY_NORMAL, rotationSensorHandler);
+        } else {
+            Log.i("SENSOR!", "Sensor.TYPE_ROTATION_VECTOR NOT Available");
+        }
+
+        accelerometer = mySensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+        if (accelerometer != null) {
+            Log.i("SENSOR!", "Sensor.TYPE_ACCELEROMETER Available");
+            HandlerThread accelerometerHandlerThread = new HandlerThread("AccelerometerThread");
+            accelerometerHandlerThread.start();
+            Handler accelerometerHandler = new Handler(accelerometerHandlerThread.getLooper());
+            mySensorManager.registerListener(accelerometerListener,
+                    accelerometer, SensorManager.SENSOR_DELAY_NORMAL, accelerometerHandler);
+
+        } else {
+            Log.i("SENSOR!", "Sensor.TYPE_ACCELEROMETER NOT Available");
+        }
+
+        gyroscope = mySensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+        if (gyroscope != null) {
+            Log.i("SENSOR!", "Sensor.TYPE_GYROSCOPE Available");
+            HandlerThread gyroscopeHandlerThread = new HandlerThread("GyroscopeThread");
+            gyroscopeHandlerThread.start();
+            Handler gyroscopeHandler = new Handler(gyroscopeHandlerThread.getLooper());
+            mySensorManager.registerListener(gyroscopeListener,
+                    gyroscope, SensorManager.SENSOR_DELAY_NORMAL, gyroscopeHandler);
+
+        } else {
+            Log.i("SENSOR!", "Sensor.TYPE_GYROSCOPE NOT Available");
+        }
+
+        magnetometer = mySensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
+        if (magnetometer != null) {
+            Log.i("SENSOR!", "Sensor.TYPE_MAGNETIC_FIELD Available");
+            HandlerThread magnetometerHandlerThread = new HandlerThread("MagnetometerThread");
+            magnetometerHandlerThread.start();
+            Handler magnetometerHandler = new Handler(magnetometerHandlerThread.getLooper());
+            mySensorManager.registerListener(magnetometerListener,
+                    magnetometer, SensorManager.SENSOR_DELAY_NORMAL, magnetometerHandler);
+
+        } else {
+            Log.i("SENSOR!", "Sensor.TYPE_MAGNETIC_FIELD NOT Available");
+        }
+
+        */
 
         // Set up the TextWatcher
         searchEditText.addTextChangedListener(new TextWatcher() {
@@ -561,11 +669,12 @@ public class MainActivity extends AppCompatActivity {
         }
         mBluetoothGatt = device.connectGatt(this, false, mGattCallback);
         // Further operations will be done in the BluetoothGattCallback
+
+        // Request high priority connection to potentially reduce the connection interval
+        mBluetoothGatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
     }
 
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
+    private void closeGatt() {
         if (mBluetoothGatt != null) {
             if (ActivityCompat.checkSelfPermission(this,
                     Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
@@ -573,7 +682,15 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
             mBluetoothGatt.close();
+            Button button = findViewById(R.id.scanButton);
+            button.setBackgroundColor(Color.parseColor("#FF0000")); // sets background color to red
             mBluetoothGatt = null;
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        closeGatt();
     }
 }
