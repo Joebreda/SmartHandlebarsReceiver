@@ -26,6 +26,7 @@ import android.hardware.SensorManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.SystemClock;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.util.Log;
@@ -72,7 +73,6 @@ public class MainActivity extends AppCompatActivity {
     private int changeCounter = 0;
     private String formattedDateTime;
     //private ByteBuffer buffer = ByteBuffer.allocate(64 * 2); // Each integer is 2 bytes
-    private final Object fileLock = new Object();
     // Variables for controlling file writing for two output files.
     private ConcurrentLinkedQueue<Integer> rearSensorDataQueue = new ConcurrentLinkedQueue<>();
     private ConcurrentLinkedQueue<Integer> sideSensorDataQueue = new ConcurrentLinkedQueue<>();
@@ -83,10 +83,19 @@ public class MainActivity extends AppCompatActivity {
     private int restartCounter;
     private int print_frame_mean = 0;
 
+    private SensorManager mySensorManager;
+
     private Sensor rotationSensor;
+    private SensorLogger rotationSensorLogger;
+
     private Sensor accelerometer;
+    private SensorLogger accelerometerLogger;
+
     private Sensor gyroscope;
+    private SensorLogger gyroscopeLogger;
+
     private Sensor magnetometer;
+    private SensorLogger magnetometerLogger;
 
     private TextView textView;
     private volatile boolean keepRunning = true;
@@ -96,27 +105,6 @@ public class MainActivity extends AppCompatActivity {
 
 
     private static final int MULTIPLE_PERMISSIONS_REQUEST_CODE = 123;
-
-    public void printFrame(int[] frame) {
-        Log.i("NEW FRAME", "FRAME: " + frame.length);
-        int i = 0;
-        while (i < frame.length) {
-            StringBuilder row = new StringBuilder();
-
-            for (int j = 0; j < 8; j++) {
-                row.append(frame[i]);
-                row.append("  ");
-                i++;
-            }
-
-            Log.i("row", row.toString());
-        }
-    }
-
-    public void updateTextView(String toThis) {
-        TextView textView = (TextView) findViewById(R.id.textView);
-        textView.setText(toThis);
-    }
 
     private void writeBufferToFile(ByteBuffer buffer, File sensorOutputFile) {
         StringBuilder csvLine = new StringBuilder();
@@ -165,6 +153,7 @@ public class MainActivity extends AppCompatActivity {
         return fileWritingThread != null && fileWritingThread.isAlive();
     }
 
+    // Thread for writing bluetooth data only.
     private synchronized Thread startFileWritingThread(Thread thread,
                                                        ConcurrentLinkedQueue<Integer> queue,
                                                        File outputFile,
@@ -261,6 +250,12 @@ public class MainActivity extends AppCompatActivity {
 
                 restartCounter++;
 
+                rotationSensorLogger.register(formattedDateTime);
+                accelerometerLogger.register(formattedDateTime);
+                gyroscopeLogger.register(formattedDateTime);
+                magnetometerLogger.register(formattedDateTime);
+
+                // Register the side and rear ToF receivers.
                 if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
                     sideSensorFileWritingThread = startFileWritingThread(
                             sideSensorFileWritingThread, sideSensorDataQueue,
@@ -284,17 +279,15 @@ public class MainActivity extends AppCompatActivity {
                 rearSensorDataQueue.clear(); // Clear the data queue
                 sideSensorFileWritingThread = stopFileWritingThread(sideSensorFileWritingThread);
                 sideSensorDataQueue.clear(); // Clear the data queue
+
+                rotationSensorLogger.close();
+                accelerometerLogger.close();
+                gyroscopeLogger.close();
+                magnetometerLogger.close();
+
                 closeGatt(); // Necessary to ensure only one bluetooth callback is registered at a time.
 
             }
-        }
-
-        private synchronized void stopThreads() {
-            // Stop the file writing thread and reset the variable to null.
-            rearSensorFileWritingThread = stopFileWritingThread(rearSensorFileWritingThread);
-            rearSensorDataQueue.clear(); // Clear the data queue
-            sideSensorFileWritingThread = stopFileWritingThread(sideSensorFileWritingThread);
-            sideSensorDataQueue.clear(); // Clear the data queue
         }
 
         @Override
@@ -463,8 +456,14 @@ public class MainActivity extends AppCompatActivity {
         mDeviceListAdapter.addAll(filteredListNames);
         mDeviceListAdapter.notifyDataSetChanged();
     }
-   /*
-    public class rotationSensorListener implements SensorEventListener {
+
+    public class SensorEventWriter implements SensorEventListener {
+        private BufferedWriter bufferedWriter;
+
+        public SensorEventWriter(BufferedWriter bufferedWriter) {
+            this.bufferedWriter = bufferedWriter;
+        }
+
         @Override
         public void onSensorChanged(SensorEvent event) {
             // Process sensor data (e.g., write to a file)
@@ -477,12 +476,94 @@ public class MainActivity extends AppCompatActivity {
         }
 
         private void writeSensorDataToFile(SensorEvent event) {
-            // Implement file writing logic here
-            // Use event.values for sensor data
-            // Use event.timestamp for the timestamp
+            try {
+                // Prepare the data string in CSV format
+                StringBuilder dataString = new StringBuilder();
+                long eventTimeInMillis = (event.timestamp / 1000000L) + System.currentTimeMillis() - SystemClock.elapsedRealtime();
+
+                dataString.append(eventTimeInMillis).append(","); // Timestamp
+
+                // Append sensor values
+                for (float value : event.values) {
+                    dataString.append(value).append(",");
+                }
+                // Remove the last comma
+                dataString.deleteCharAt(dataString.length() - 1);
+                // Write to file and add a new line
+                bufferedWriter.write(dataString.toString());
+                bufferedWriter.newLine();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         }
     }
-    */
+
+    public class SensorLogger {
+        private SensorManager sensorManager;
+        private Sensor sensor;
+        private String sensorType;
+
+        private SensorEventListener sensorEventListener;
+        private HandlerThread handlerThread;
+        private BufferedWriter bufferedWriter;
+
+        public SensorLogger(SensorManager sensorManager, Sensor sensor, String sensorType) {
+
+            this.sensorManager = sensorManager;
+            this.sensor = sensor;
+            this.sensorType = sensorType;
+        }
+
+        public void register(String commonFileName) {
+            if (this.sensor != null) {
+                this.handlerThread = new HandlerThread(this.sensorType + "SensorThread");
+                this.handlerThread.start();
+                Handler sensorHandler = new Handler(this.handlerThread.getLooper());
+                // Initialize BufferedWriter
+                File file = new File(getExternalFilesDir(null), commonFileName + "_" + this.sensorType + ".csv");
+                try {
+                    this.bufferedWriter = new BufferedWriter(new FileWriter(file, true)); // 'true' to append
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+                // Initialize your sensor event listener
+                this.sensorEventListener = new SensorEventWriter(this.bufferedWriter);
+                this.sensorManager.registerListener(this.sensorEventListener,
+                        this.sensor, this.sensorManager.SENSOR_DELAY_NORMAL, sensorHandler);
+            } else {
+                Log.i("SENSOR!", sensorType + " NOT Available");
+            }
+        }
+
+        public void close() {
+            // Unregister the sensor listener
+            if (this.sensorEventListener != null) {
+                this.sensorManager.unregisterListener(this.sensorEventListener);
+                this.sensorEventListener = null;
+            }
+
+            // Close the BufferedWriter
+            try {
+                if (this.bufferedWriter != null) {
+                    this.bufferedWriter.close();
+                    this.bufferedWriter = null;
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
+            // Stop the HandlerThread
+            if (this.handlerThread != null) {
+                this.handlerThread.quitSafely();
+                try {
+                    this.handlerThread.join();
+                    this.handlerThread = null;
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -501,62 +582,20 @@ public class MainActivity extends AppCompatActivity {
         formatter = DateTimeFormatter.ofPattern("dd-MM-yyyy_HH:mm:ss");
         textView = (TextView) findViewById(R.id.textView);
 
-        /*
         // Initialize the IMU sensors.
-        SensorManager mySensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
-
+        mySensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
         rotationSensor = mySensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
-        if (rotationSensor != null) {
-            Log.i("SENSOR!", "Sensor.TYPE_ROTATION_VECTOR Available");
-            HandlerThread rotationSensorHandlerThread = new HandlerThread("RotationSensorThread");
-            rotationSensorHandlerThread.start();
-            Handler rotationSensorHandler = new Handler(rotationSensorHandlerThread.getLooper());
-            mySensorManager.registerListener(rotationSensorListener,
-                    rotationSensor, SensorManager.SENSOR_DELAY_NORMAL, rotationSensorHandler);
-        } else {
-            Log.i("SENSOR!", "Sensor.TYPE_ROTATION_VECTOR NOT Available");
-        }
-
+        rotationSensorLogger = new SensorLogger(
+                mySensorManager, rotationSensor, "rotation");
         accelerometer = mySensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
-        if (accelerometer != null) {
-            Log.i("SENSOR!", "Sensor.TYPE_ACCELEROMETER Available");
-            HandlerThread accelerometerHandlerThread = new HandlerThread("AccelerometerThread");
-            accelerometerHandlerThread.start();
-            Handler accelerometerHandler = new Handler(accelerometerHandlerThread.getLooper());
-            mySensorManager.registerListener(accelerometerListener,
-                    accelerometer, SensorManager.SENSOR_DELAY_NORMAL, accelerometerHandler);
-
-        } else {
-            Log.i("SENSOR!", "Sensor.TYPE_ACCELEROMETER NOT Available");
-        }
-
+        accelerometerLogger = new SensorLogger(
+                mySensorManager, accelerometer, "accelerometer");
         gyroscope = mySensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
-        if (gyroscope != null) {
-            Log.i("SENSOR!", "Sensor.TYPE_GYROSCOPE Available");
-            HandlerThread gyroscopeHandlerThread = new HandlerThread("GyroscopeThread");
-            gyroscopeHandlerThread.start();
-            Handler gyroscopeHandler = new Handler(gyroscopeHandlerThread.getLooper());
-            mySensorManager.registerListener(gyroscopeListener,
-                    gyroscope, SensorManager.SENSOR_DELAY_NORMAL, gyroscopeHandler);
-
-        } else {
-            Log.i("SENSOR!", "Sensor.TYPE_GYROSCOPE NOT Available");
-        }
-
+        gyroscopeLogger = new SensorLogger(
+                mySensorManager, gyroscope, "gyroscope");
         magnetometer = mySensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
-        if (magnetometer != null) {
-            Log.i("SENSOR!", "Sensor.TYPE_MAGNETIC_FIELD Available");
-            HandlerThread magnetometerHandlerThread = new HandlerThread("MagnetometerThread");
-            magnetometerHandlerThread.start();
-            Handler magnetometerHandler = new Handler(magnetometerHandlerThread.getLooper());
-            mySensorManager.registerListener(magnetometerListener,
-                    magnetometer, SensorManager.SENSOR_DELAY_NORMAL, magnetometerHandler);
-
-        } else {
-            Log.i("SENSOR!", "Sensor.TYPE_MAGNETIC_FIELD NOT Available");
-        }
-
-        */
+        magnetometerLogger = new SensorLogger(
+                mySensorManager, magnetometer, "magnetometer");
 
         // Set up the TextWatcher
         searchEditText.addTextChangedListener(new TextWatcher() {
