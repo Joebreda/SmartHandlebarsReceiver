@@ -2,10 +2,12 @@ package com.ubicomplab.biketofreceiver;
 
 import android.Manifest;
 
+import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
@@ -23,6 +25,9 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -68,9 +73,6 @@ public class MainActivity extends AppCompatActivity {
     private ArrayAdapter<String> mDeviceListAdapter;  // List of strings to display on the screen.
     private ListView mDeviceListView;
     private boolean currentlyScanning = false;
-    private int[] frame = new int[8*8];
-    private int pixel_index = 0;
-    private int changeCounter = 0;
     private String formattedDateTime;
     //private ByteBuffer buffer = ByteBuffer.allocate(64 * 2); // Each integer is 2 bytes
     // Variables for controlling file writing for two output files.
@@ -80,8 +82,8 @@ public class MainActivity extends AppCompatActivity {
     private Thread sideSensorFileWritingThread = null;
     private File rearSensorOutputFile;
     private File sideSensorOutputFile;
+    private String audioFilePath;
     private int restartCounter;
-    private int print_frame_mean = 0;
 
     private SensorManager mySensorManager;
 
@@ -102,6 +104,7 @@ public class MainActivity extends AppCompatActivity {
     DateTimeFormatter formatter;
     private int frame_mean = 0;
 
+    private AudioRecordThread audioRecordThread;
 
 
     private static final int MULTIPLE_PERMISSIONS_REQUEST_CODE = 123;
@@ -132,7 +135,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
         try (BufferedWriter bw = new BufferedWriter(
-                new FileWriter(sensorOutputFile,true))) {
+                new FileWriter(sensorOutputFile, true))) {
             bw.write(csvLine.toString());
             bw.newLine();
         } catch (IOException e) {
@@ -254,6 +257,7 @@ public class MainActivity extends AppCompatActivity {
                 accelerometerLogger.register(formattedDateTime);
                 gyroscopeLogger.register(formattedDateTime);
                 magnetometerLogger.register(formattedDateTime);
+                audioFilePath = getExternalFilesDir(null) + "/" + formattedDateTime + "_audio.pcm";
 
                 // Register the side and rear ToF receivers.
                 if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
@@ -267,6 +271,25 @@ public class MainActivity extends AppCompatActivity {
                             rearSensorFileWritingThread, rearSensorDataQueue,
                             rearSensorOutputFile, "rearSensorThread" + restartCounter);
                 }
+
+                if (ActivityCompat.checkSelfPermission(getApplicationContext(),
+                        Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                    ActivityCompat.requestPermissions(MainActivity.this,
+                            new String[]{Manifest.permission.RECORD_AUDIO}, 5);
+                }
+                int bufferSize = AudioRecord.getMinBufferSize(
+                        44100,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT);
+                AudioRecord audioRecord = new AudioRecord(
+                        MediaRecorder.AudioSource.UNPROCESSED,//MediaRecorder.AudioSource.MIC,
+                        44100,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        bufferSize);
+
+                audioRecordThread = new AudioRecordThread(audioFilePath, audioRecord, bufferSize);
+                audioRecordThread.startRecording();
 
 
                 mBluetoothGatt.discoverServices();
@@ -284,6 +307,8 @@ public class MainActivity extends AppCompatActivity {
                 accelerometerLogger.close();
                 gyroscopeLogger.close();
                 magnetometerLogger.close();
+
+                audioRecordThread.stopRecording();
 
                 closeGatt(); // Necessary to ensure only one bluetooth callback is registered at a time.
 
@@ -345,26 +370,17 @@ public class MainActivity extends AppCompatActivity {
 
                 int sensorIndex = data[0] & 0xFF;
                 int packetIndex = data[1] & 0xFF;
+                //int sensorIndex = (data[0] & 0xF0) >> 4;
+                //int packetIndex = data[0] & 0x0F;
+                int readCount = 0;
+                //int readCount = data[1] & 0xFF;
                 int firstPayloadInt = ((data[2] & 0xFF) << 8) | (data[3] & 0xFF);
 
-                Log.i("Received data",  "from sensor " + sensorIndex + " packet " + packetIndex + " at time " + timestamp + " first value was " + firstPayloadInt);
+                Log.i("Received data", readCount + ": from sensor " + sensorIndex + " packet " + packetIndex + " at time " + timestamp + " first value was " + firstPayloadInt);
                 // Add received data to the respective queue
-                /*
-                if (sensorIndex == 1) {
-                    for (byte b : data) {
-                        rearSensorDataQueue.offer(b);
-                    }
-                    rearSensorDataQueue.offer((byte) '\n');
-                } else if (sensorIndex == 2) {
-                    for (byte b : data) {
-                        sideSensorDataQueue.offer(b);
-                    }
-                    sideSensorDataQueue.offer((byte) '\n');
-                }
-                */
                 // Assume data.length is always even and > 2 for simplicity
                 for (int i = 2; i < data.length; i += 2) {
-                    int value = ((data[i] & 0xFF) << 8) | (data[i+1] & 0xFF);
+                    int value = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
                     if (sensorIndex == 1) {
                         rearSensorDataQueue.offer(value);
                     } else if (sensorIndex == 2) {
@@ -406,7 +422,7 @@ public class MainActivity extends AppCompatActivity {
                 Manifest.permission.BLUETOOTH_ADMIN,
                 Manifest.permission.BLUETOOTH_CONNECT,
                 Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.WRITE_EXTERNAL_STORAGE
+                Manifest.permission.WRITE_EXTERNAL_STORAGE,
         };
 
         boolean allPermissionsGranted = true;
@@ -731,5 +747,60 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         closeGatt();
+    }
+
+    public class AudioRecordThread extends Thread {
+        private boolean isRecording;
+        private AudioRecord audioRecord;
+        private int bufferSize;
+        private String outputFile;
+
+        public AudioRecordThread(String outputFile, AudioRecord audioRecord, int bufferSize) {
+            this.outputFile = outputFile;
+            this.bufferSize = bufferSize;
+            this.audioRecord = audioRecord;
+            //Log.i("audio record thread", this.outputFile);
+        }
+
+        public void startRecording() {
+            isRecording = true;
+            audioRecord.startRecording();
+            start();
+            //Log.i("audio record thread", "started");
+        }
+
+        public void stopRecording() {
+            isRecording = false;
+            audioRecord.stop();
+            audioRecord.release();
+            //Log.i("audio record thread", "stopped");
+        }
+
+        @Override
+        public void run() {
+            FileOutputStream fos = null;
+            try {
+                fos = new FileOutputStream(outputFile);
+                byte[] audioData = new byte[bufferSize];
+
+                while (isRecording) {
+                    //Log.i("audio record thread", "running");
+                    int read = audioRecord.read(audioData, 0, bufferSize);
+                    if (read > 0) {
+                        fos.write(audioData, 0, read);
+                    }
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                try {
+                    if (fos != null) {
+                        fos.close();
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
     }
 }
