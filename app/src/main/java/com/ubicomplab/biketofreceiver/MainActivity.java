@@ -25,12 +25,14 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.location.Location;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.text.Editable;
 import android.text.TextWatcher;
@@ -55,8 +57,23 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
+
+import com.google.android.gms.common.api.ResolvableApiException;
+import com.google.android.gms.location.FusedLocationProviderClient;
+import com.google.android.gms.location.LocationCallback;
+import com.google.android.gms.location.LocationRequest;
+import com.google.android.gms.location.LocationResult;
+import com.google.android.gms.location.LocationServices;
+import com.google.android.gms.location.LocationSettingsRequest;
+import com.google.android.gms.location.LocationSettingsResponse;
+import com.google.android.gms.location.Priority;
+import com.google.android.gms.location.SettingsClient;
+import com.google.android.gms.tasks.OnFailureListener;
+import com.google.android.gms.tasks.OnSuccessListener;
+import com.google.android.gms.tasks.Task;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -78,36 +95,82 @@ public class MainActivity extends AppCompatActivity {
     // Variables for controlling file writing for two output files.
     private ConcurrentLinkedQueue<Integer> rearSensorDataQueue = new ConcurrentLinkedQueue<>();
     private ConcurrentLinkedQueue<Integer> sideSensorDataQueue = new ConcurrentLinkedQueue<>();
+    private ConcurrentLinkedQueue<String> locationQueue = new ConcurrentLinkedQueue<>();
     private Thread rearSensorFileWritingThread = null;
     private Thread sideSensorFileWritingThread = null;
+    private Thread locationFileWritingThread = null;
     private File rearSensorOutputFile;
     private File sideSensorOutputFile;
+    private File locationOutputFile;
     private String audioFilePath;
     private int restartCounter;
 
     private SensorManager mySensorManager;
-
     private Sensor rotationSensor;
     private SensorLogger rotationSensorLogger;
-
     private Sensor accelerometer;
     private SensorLogger accelerometerLogger;
-
     private Sensor gyroscope;
     private SensorLogger gyroscopeLogger;
-
     private Sensor magnetometer;
     private SensorLogger magnetometerLogger;
 
     private TextView textView;
+    private TextView locationIndicator;
     private volatile boolean keepRunning = true;
     DateTimeFormatter formatter;
     private int frame_mean = 0;
 
+    private boolean hasAttemptedReconnect = false;
+    private Handler reconnectionHandler = new Handler(Looper.getMainLooper());
+    private static final long RECONNECTION_TIMEOUT_MS = 5000; // 5 seconds
+    private Runnable reconnectionTimeoutRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (hasAttemptedReconnect) {
+                // Reconnection attempt timed out
+                closeGatt();
+            }
+        }
+    };
+
+    private LocationRequest locationRequest;
+    private LocationCallback locationCallback;
+    private FusedLocationProviderClient mFusedLocationClient;
+
     private AudioRecordThread audioRecordThread;
+
+    // BLE reconnect attempt code.
+    private static final long INITIAL_RECONNECT_DELAY_MS = 1000; // 1 second
+    private static final int MAX_RECONNECT_ATTEMPTS = 5;
+    private long reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+    private int reconnectAttempts = 0;
 
 
     private static final int MULTIPLE_PERMISSIONS_REQUEST_CODE = 123;
+
+    private void handleReconnection(BluetoothGatt gatt) {
+        hasAttemptedReconnect = true;
+        // Attempt to reconnect
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        boolean isReconnecting = gatt.connect();
+        Button button = findViewById(R.id.scanButton);
+        button.setBackgroundColor(Color.parseColor("#FFFF00")); // sets background color to red
+        if (!isReconnecting) {
+            // If reconnection fails immediately, close GATT
+            closeGatt();
+        } else {
+            // Start a timeout for the reconnection attempt
+            reconnectionHandler.postDelayed(reconnectionTimeoutRunnable, RECONNECTION_TIMEOUT_MS);
+        }
+    }
+
+    private void resetReconnectionAttempts() {
+        reconnectAttempts = 0;
+        reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+    }
 
     private void writeBufferToFile(ByteBuffer buffer, File sensorOutputFile) {
         StringBuilder csvLine = new StringBuilder();
@@ -209,6 +272,35 @@ public class MainActivity extends AppCompatActivity {
         return thread;
     }
 
+    // Thread for writing bluetooth data only.
+    private synchronized Thread startLocationFileWritingThread(Thread thread,
+                                                       ConcurrentLinkedQueue<String> queue,
+                                                       File outputFile,
+                                                       String threadName) {
+        // if thread is already running just return it.
+        if (isFileWritingThreadRunning(thread)) {
+            return thread;
+            //return; // The thread is already running
+        }
+        keepRunning = true;
+
+        thread = new Thread(() -> {
+            while (keepRunning) {
+                while (!queue.isEmpty()) {
+                    String polledValue = queue.poll();
+                    writeLineToFile(polledValue, outputFile);
+                }
+                try {
+                    Thread.sleep(10); // Sleep for 10 milliseconds
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, threadName);
+        thread.start();
+        return thread;
+    }
+
     private synchronized Thread stopFileWritingThread(Thread thread) {
         if (!isFileWritingThreadRunning(thread)) {
             return null; // The thread is not running
@@ -240,15 +332,20 @@ public class MainActivity extends AppCompatActivity {
 
                 // Request larger MTU size
                 //gatt.requestMtu(260);
+                hasAttemptedReconnect = false;
+                reconnectionHandler.removeCallbacks(reconnectionTimeoutRunnable);
 
                 // Create a new output file to write to each time you reconnection.
                 LocalDateTime now = LocalDateTime.now();
                 formattedDateTime = now.format(formatter);
                 String rearFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_rear.csv";
                 String sideFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_side.csv";
+                String locationFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_location.csv";
+
                 Log.i("FILEPATH:", rearFilename + "");
                 rearSensorOutputFile = new File(rearFilename);
                 sideSensorOutputFile = new File(sideFilename);
+                locationOutputFile = new File(locationFilename);
                 frame_mean = 0;
 
                 restartCounter++;
@@ -266,7 +363,6 @@ public class MainActivity extends AppCompatActivity {
                             sideSensorOutputFile, "sideSensorThread" + restartCounter);
                 }
                 if (!isFileWritingThreadRunning(rearSensorFileWritingThread)) {
-                    //rearSensorFileWritingThread = startFileWritingThread(rearSensorFileWritingThread);
                     rearSensorFileWritingThread = startFileWritingThread(
                             rearSensorFileWritingThread, rearSensorDataQueue,
                             rearSensorOutputFile, "rearSensorThread" + restartCounter);
@@ -291,6 +387,15 @@ public class MainActivity extends AppCompatActivity {
                 audioRecordThread = new AudioRecordThread(audioFilePath, audioRecord, bufferSize);
                 audioRecordThread.startRecording();
 
+                startLocationUpdates();
+
+                // For logging location file (uses a different function to define thread than other writer threads).
+                if (!isFileWritingThreadRunning(locationFileWritingThread)) {
+                    locationFileWritingThread = startLocationFileWritingThread(
+                            locationFileWritingThread, locationQueue,
+                            locationOutputFile, "locationThread" + restartCounter);
+                }
+
 
                 mBluetoothGatt.discoverServices();
                 Log.i("BLE", "Attempting to start service discovery");
@@ -310,7 +415,15 @@ public class MainActivity extends AppCompatActivity {
 
                 audioRecordThread.stopRecording();
 
-                closeGatt(); // Necessary to ensure only one bluetooth callback is registered at a time.
+                locationFileWritingThread = stopFileWritingThread(locationFileWritingThread);
+                locationQueue.clear(); // Clear the data queue
+
+                //closeGatt(); // Necessary to ensure only one bluetooth callback is registered at a time.
+                if (!hasAttemptedReconnect) {
+                    handleReconnection(gatt);
+                } else {
+                    closeGatt();
+                }
 
             }
         }
@@ -586,6 +699,7 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        locationIndicator = findViewById(R.id.locationIndicator);
         restartCounter = 0;
         mDeviceList = new ArrayList<>();
         mDeviceListAdapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1);
@@ -802,5 +916,94 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
         }
+    }
+
+    // Trigger new location updates at interval
+    protected void startLocationUpdates() {
+        // Set up the reoccurring request.
+        locationRequest = new LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5000)
+                .setWaitForAccurateLocation(false)
+                .setMinUpdateIntervalMillis(1000)
+                .setMaxUpdateDelayMillis(5000)
+                .build();
+
+        // Added location settings request?
+        LocationSettingsRequest.Builder builder = new LocationSettingsRequest.Builder()
+                .addLocationRequest(locationRequest);
+        SettingsClient client = LocationServices.getSettingsClient(this);
+        Task<LocationSettingsResponse> task = client.checkLocationSettings(builder.build());
+
+        task.addOnSuccessListener(this, new OnSuccessListener<LocationSettingsResponse>() {
+            @Override
+            public void onSuccess(LocationSettingsResponse locationSettingsResponse) {
+                // All location settings are satisfied. The client can initialize
+                // location requests here.
+                // ...
+                Log.i("LOCATION", "Successfully got location setting response");
+            }
+        });
+        task.addOnFailureListener(this, new OnFailureListener() {
+            @Override
+            public void onFailure(@NonNull Exception e) {
+                if (e instanceof ResolvableApiException) {
+                    // Location settings are not satisfied, but this can be fixed
+                    // by showing the user a dialog.
+                }
+            }
+        });
+
+        //Toast.makeText(getApplicationContext(), "Starting Location Updates!", Toast.LENGTH_SHORT).show();
+
+        Log.i("LOCATION", "Starting location requests.");
+
+        // TODO: Maybe move this to on create?
+        locationCallback = new LocationCallback() {
+            @Override
+            public void onLocationResult(LocationResult locationResult) {
+                if (locationResult == null) {
+                    Log.i("LOCATION", "Null result...");
+                    //Toast.makeText(getApplicationContext(), "LocationCallback NULL", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                for (Location location : locationResult.getLocations()) {
+                    if (location != null) {
+                        double latitude = location.getLatitude();
+                        double longitude = location.getLongitude();
+                        String locationString = String.format(Locale.US, "%s -- %s", latitude, longitude);
+                        long timestamp = System.currentTimeMillis();
+                        String locationRow = timestamp + "," + locationString;
+                        // Only offer to queue if the start button has been pressed.
+                        if (locationFileWritingThread != null) {
+                            locationQueue.offer(locationRow);
+                        }
+                        locationIndicator.setText(locationString);
+                        Log.i("LOCATION", "Got a location at " + latitude + " " + longitude);
+                        //Toast.makeText(getApplicationContext(), "LocationCallback SUCCESS!", Toast.LENGTH_SHORT).show();
+                    }
+                }
+            }
+        };
+
+        // Just a check to make sure locationClient is defined.
+        if (mFusedLocationClient == null) {
+            mFusedLocationClient = LocationServices.getFusedLocationProviderClient(this);
+            if (ActivityCompat.checkSelfPermission(this,
+                    Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(
+                    this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                // TODO: Consider calling
+                //    ActivityCompat#requestPermissions
+                // here to request the missing permissions, and then overriding
+                //   public void onRequestPermissionsResult(int requestCode, String[] permissions,
+                //                                          int[] grantResults)
+                // to handle the case where the user grants the permission. See the documentation
+                // for ActivityCompat#requestPermissions for more details.
+                Log.i("LOCATION", "Could not get permission.");
+                return;
+            }
+        }
+        // Connection locationClient to locationRequest and callback.
+        mFusedLocationClient.requestLocationUpdates(locationRequest,
+                locationCallback,
+                Looper.getMainLooper());
     }
 }
