@@ -8,6 +8,7 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import android.app.Activity;
+import android.app.PendingIntent;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
@@ -19,12 +20,19 @@ import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbDeviceConnection;
+import android.hardware.usb.UsbManager;
 import android.location.Location;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
@@ -53,9 +61,12 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
@@ -75,7 +86,16 @@ import com.google.android.gms.tasks.OnFailureListener;
 import com.google.android.gms.tasks.OnSuccessListener;
 import com.google.android.gms.tasks.Task;
 
+import com.felhr.usbserial.UsbSerialDevice;
+import com.felhr.usbserial.UsbSerialInterface;
+
 public class MainActivity extends AppCompatActivity {
+
+    public static final String ACTION_USB_PERMISSION = "com.ubicomplab.biketofreceiver.USB_PERMISSION";
+    static UsbSerialDevice serialPort;
+    UsbDeviceConnection connection;
+    static Button serialLoggingButton;
+    boolean serialLogging;
 
     UUID MY_SERVICE_UUID = UUID.fromString("10336bc0-c8f9-4de7-b637-a68b7ef33fc9");
     UUID MY_CHARACTERISTIC_UUID = UUID.fromString("43336bc0-c8f9-4de7-b637-a68b7ef33fc9");
@@ -93,8 +113,10 @@ public class MainActivity extends AppCompatActivity {
     private String formattedDateTime;
     //private ByteBuffer buffer = ByteBuffer.allocate(64 * 2); // Each integer is 2 bytes
     // Variables for controlling file writing for two output files.
-    private ConcurrentLinkedQueue<Integer> rearSensorDataQueue = new ConcurrentLinkedQueue<>();
-    private ConcurrentLinkedQueue<Integer> sideSensorDataQueue = new ConcurrentLinkedQueue<>();
+    private ConcurrentLinkedQueue<Integer> rearSensorDataQueueBLE = new ConcurrentLinkedQueue<>();
+    private ConcurrentLinkedQueue<Integer> sideSensorDataQueueBLE = new ConcurrentLinkedQueue<>();
+    private ConcurrentLinkedQueue<String> rearSensorDataQueueSerial = new ConcurrentLinkedQueue<>();
+    private ConcurrentLinkedQueue<String> sideSensorDataQueueSerial = new ConcurrentLinkedQueue<>();
     private ConcurrentLinkedQueue<String> locationQueue = new ConcurrentLinkedQueue<>();
     private Thread rearSensorFileWritingThread = null;
     private Thread sideSensorFileWritingThread = null;
@@ -157,7 +179,7 @@ public class MainActivity extends AppCompatActivity {
         }
         boolean isReconnecting = gatt.connect();
         Button button = findViewById(R.id.scanButton);
-        button.setBackgroundColor(Color.parseColor("#FFFF00")); // sets background color to red
+        button.setBackgroundColor(Color.parseColor("#FFFF00")); // sets background color to Yellow
         if (!isReconnecting) {
             // If reconnection fails immediately, close GATT
             closeGatt();
@@ -227,16 +249,13 @@ public class MainActivity extends AppCompatActivity {
         // if thread is already running just return it.
         if (isFileWritingThreadRunning(thread)) {
             return thread;
-            //return; // The thread is already running
         }
         keepRunning = true;
-        //Log.i("STARTING THREAD", "Starting thread: " + threadName);
 
         thread = new Thread(() -> {
             StringBuilder csvLine = new StringBuilder();
             while (keepRunning) {
                 while (!queue.isEmpty()) {
-                    //Log.i("ThreadName", threadName);
                     Integer polledValue = queue.poll();
                     int value = -999;
                     if (polledValue != null) {
@@ -272,8 +291,8 @@ public class MainActivity extends AppCompatActivity {
         return thread;
     }
 
-    // Thread for writing bluetooth data only.
-    private synchronized Thread startLocationFileWritingThread(Thread thread,
+    // Thread for writing data which is passed to the concurrentLinkedQueue as a complete row including timestamp.
+    private synchronized Thread startStringRowFileWritingThread(Thread thread,
                                                        ConcurrentLinkedQueue<String> queue,
                                                        File outputFile,
                                                        String threadName) {
@@ -319,6 +338,104 @@ public class MainActivity extends AppCompatActivity {
         return null;
     }
 
+    public void startLoggingAllSensors(boolean overBLE){
+        // Create a new output file to write to each time you reconnection.
+        LocalDateTime now = LocalDateTime.now();
+        formattedDateTime = now.format(formatter);
+        String rearFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_rear.csv";
+        String sideFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_side.csv";
+        String locationFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_location.csv";
+
+        Log.i("FILEPATH:", rearFilename + "");
+        rearSensorOutputFile = new File(rearFilename);
+        sideSensorOutputFile = new File(sideFilename);
+        locationOutputFile = new File(locationFilename);
+        frame_mean = 0;
+
+        restartCounter++;
+
+        rotationSensorLogger.register(formattedDateTime);
+        accelerometerLogger.register(formattedDateTime);
+        gyroscopeLogger.register(formattedDateTime);
+        magnetometerLogger.register(formattedDateTime);
+        audioFilePath = getExternalFilesDir(null) + "/" + formattedDateTime + "_audio.pcm";
+
+        // TODO These file writing threads handle timestamping which is dumb. Should move this to .offer.
+        if (overBLE) {
+            // Register the side and rear ToF receivers over BLE communication.
+            if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
+                sideSensorFileWritingThread = startFileWritingThread(
+                        sideSensorFileWritingThread, sideSensorDataQueueBLE,
+                        sideSensorOutputFile, "sideSensorThread" + restartCounter);
+            }
+            if (!isFileWritingThreadRunning(rearSensorFileWritingThread)) {
+                rearSensorFileWritingThread = startFileWritingThread(
+                        rearSensorFileWritingThread, rearSensorDataQueueBLE,
+                        rearSensorOutputFile, "rearSensorThread" + restartCounter);
+            }
+        } else {
+            // Register the side and rear ToF receivers over Serial Connection.
+            if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
+                sideSensorFileWritingThread = startStringRowFileWritingThread(
+                        sideSensorFileWritingThread, sideSensorDataQueueSerial,
+                        sideSensorOutputFile, "sideSensorThread" + restartCounter);
+            }
+            if (!isFileWritingThreadRunning(rearSensorFileWritingThread)) {
+                rearSensorFileWritingThread = startStringRowFileWritingThread(
+                        rearSensorFileWritingThread, rearSensorDataQueueSerial,
+                        rearSensorOutputFile, "rearSensorThread" + restartCounter);
+            }
+        }
+
+
+        if (ActivityCompat.checkSelfPermission(getApplicationContext(),
+                Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(MainActivity.this,
+                    new String[]{Manifest.permission.RECORD_AUDIO}, 5);
+        }
+        int bufferSize = AudioRecord.getMinBufferSize(
+                44100,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT);
+        AudioRecord audioRecord = new AudioRecord(
+                MediaRecorder.AudioSource.UNPROCESSED,//MediaRecorder.AudioSource.MIC,
+                44100,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize);
+
+        audioRecordThread = new AudioRecordThread(audioFilePath, audioRecord, bufferSize);
+        audioRecordThread.startRecording();
+
+        startLocationUpdates();
+
+        // For logging location file (uses a different function to define thread than other writer threads).
+        if (!isFileWritingThreadRunning(locationFileWritingThread)) {
+            locationFileWritingThread = startStringRowFileWritingThread(
+                    locationFileWritingThread, locationQueue,
+                    locationOutputFile, "locationThread" + restartCounter);
+        }
+    }
+
+    private void stopLoggingAllSensors(){
+        rearSensorFileWritingThread = stopFileWritingThread(rearSensorFileWritingThread);
+        rearSensorDataQueueBLE.clear(); // Clear the data queue
+        rearSensorDataQueueSerial.clear(); // Clear the data queue
+        sideSensorFileWritingThread = stopFileWritingThread(sideSensorFileWritingThread);
+        sideSensorDataQueueBLE.clear(); // Clear the data queue
+        sideSensorDataQueueSerial.clear(); // Clear the data queue
+
+        rotationSensorLogger.close();
+        accelerometerLogger.close();
+        gyroscopeLogger.close();
+        magnetometerLogger.close();
+
+        audioRecordThread.stopRecording();
+
+        locationFileWritingThread = stopFileWritingThread(locationFileWritingThread);
+        locationQueue.clear(); // Clear the data queue
+    }
+
     private final BluetoothGattCallback mGattCallback = new BluetoothGattCallback() {
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
@@ -335,66 +452,8 @@ public class MainActivity extends AppCompatActivity {
                 hasAttemptedReconnect = false;
                 reconnectionHandler.removeCallbacks(reconnectionTimeoutRunnable);
 
-                // Create a new output file to write to each time you reconnection.
-                LocalDateTime now = LocalDateTime.now();
-                formattedDateTime = now.format(formatter);
-                String rearFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_rear.csv";
-                String sideFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_side.csv";
-                String locationFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_location.csv";
-
-                Log.i("FILEPATH:", rearFilename + "");
-                rearSensorOutputFile = new File(rearFilename);
-                sideSensorOutputFile = new File(sideFilename);
-                locationOutputFile = new File(locationFilename);
-                frame_mean = 0;
-
-                restartCounter++;
-
-                rotationSensorLogger.register(formattedDateTime);
-                accelerometerLogger.register(formattedDateTime);
-                gyroscopeLogger.register(formattedDateTime);
-                magnetometerLogger.register(formattedDateTime);
-                audioFilePath = getExternalFilesDir(null) + "/" + formattedDateTime + "_audio.pcm";
-
-                // Register the side and rear ToF receivers.
-                if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
-                    sideSensorFileWritingThread = startFileWritingThread(
-                            sideSensorFileWritingThread, sideSensorDataQueue,
-                            sideSensorOutputFile, "sideSensorThread" + restartCounter);
-                }
-                if (!isFileWritingThreadRunning(rearSensorFileWritingThread)) {
-                    rearSensorFileWritingThread = startFileWritingThread(
-                            rearSensorFileWritingThread, rearSensorDataQueue,
-                            rearSensorOutputFile, "rearSensorThread" + restartCounter);
-                }
-
-                if (ActivityCompat.checkSelfPermission(getApplicationContext(),
-                        Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                    ActivityCompat.requestPermissions(MainActivity.this,
-                            new String[]{Manifest.permission.RECORD_AUDIO}, 5);
-                }
-                int bufferSize = AudioRecord.getMinBufferSize(
-                        44100,
-                        AudioFormat.CHANNEL_IN_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT);
-                AudioRecord audioRecord = new AudioRecord(
-                        MediaRecorder.AudioSource.UNPROCESSED,//MediaRecorder.AudioSource.MIC,
-                        44100,
-                        AudioFormat.CHANNEL_IN_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT,
-                        bufferSize);
-
-                audioRecordThread = new AudioRecordThread(audioFilePath, audioRecord, bufferSize);
-                audioRecordThread.startRecording();
-
-                startLocationUpdates();
-
-                // For logging location file (uses a different function to define thread than other writer threads).
-                if (!isFileWritingThreadRunning(locationFileWritingThread)) {
-                    locationFileWritingThread = startLocationFileWritingThread(
-                            locationFileWritingThread, locationQueue,
-                            locationOutputFile, "locationThread" + restartCounter);
-                }
+                // Start logging all sensors!
+                startLoggingAllSensors(true);
 
 
                 mBluetoothGatt.discoverServices();
@@ -403,20 +462,7 @@ public class MainActivity extends AppCompatActivity {
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.i("BLE", "Disconnected from GATT server.");
                 // Stop the file writing thread and reset the variable to null.
-                rearSensorFileWritingThread = stopFileWritingThread(rearSensorFileWritingThread);
-                rearSensorDataQueue.clear(); // Clear the data queue
-                sideSensorFileWritingThread = stopFileWritingThread(sideSensorFileWritingThread);
-                sideSensorDataQueue.clear(); // Clear the data queue
-
-                rotationSensorLogger.close();
-                accelerometerLogger.close();
-                gyroscopeLogger.close();
-                magnetometerLogger.close();
-
-                audioRecordThread.stopRecording();
-
-                locationFileWritingThread = stopFileWritingThread(locationFileWritingThread);
-                locationQueue.clear(); // Clear the data queue
+                stopLoggingAllSensors();
 
                 //closeGatt(); // Necessary to ensure only one bluetooth callback is registered at a time.
                 if (!hasAttemptedReconnect) {
@@ -495,9 +541,9 @@ public class MainActivity extends AppCompatActivity {
                 for (int i = 2; i < data.length; i += 2) {
                     int value = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
                     if (sensorIndex == 1) {
-                        rearSensorDataQueue.offer(value);
+                        rearSensorDataQueueBLE.offer(value);
                     } else if (sensorIndex == 2) {
-                        sideSensorDataQueue.offer(value);
+                        sideSensorDataQueueBLE.offer(value);
                     }
                 }
 
@@ -505,7 +551,7 @@ public class MainActivity extends AppCompatActivity {
                 int endOfPacketMarker = Integer.MAX_VALUE; // or some other value that won't conflict with actual data
                 int endOfReading = Integer.MIN_VALUE;
                 if (sensorIndex == 1) {
-                    rearSensorDataQueue.offer(endOfPacketMarker - packetIndex);
+                    rearSensorDataQueueBLE.offer(endOfPacketMarker - packetIndex);
                     // TODO update this in the case that there are more than 2 packets per reading.
                     if (packetIndex == 1) {
                         runOnUiThread(new Runnable() {
@@ -515,12 +561,12 @@ public class MainActivity extends AppCompatActivity {
                                 textView.setText(firstPayloadInt + "");
                             }
                         });
-                        rearSensorDataQueue.offer(endOfReading);
+                        rearSensorDataQueueBLE.offer(endOfReading);
                     }
                 } else if (sensorIndex == 2) {
-                    sideSensorDataQueue.offer(endOfPacketMarker - packetIndex);
+                    sideSensorDataQueueBLE.offer(endOfPacketMarker - packetIndex);
                     if (packetIndex == 1) {
-                        sideSensorDataQueue.offer(endOfReading);
+                        sideSensorDataQueueBLE.offer(endOfReading);
                     }
                 }
             }
@@ -699,6 +745,25 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        String testfile = getExternalFilesDir(null) + "/" + formattedDateTime + "test.csv";
+        Log.i("FILEPATH:", testfile + "");
+
+        // Write logs to log file
+        // TODO Uncomment if you need to debug serial connection code.
+        try {
+            // Define the log file
+            String filename = "zzz_logcat_" + System.currentTimeMillis() + ".txt";
+            File outputFile = new File(getExternalFilesDir(null), filename);
+
+            // Start the logcat process
+            Process process = Runtime.getRuntime().exec("logcat -f " + outputFile.getAbsolutePath());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+        registerReceiver(usbPermissionReceiver, filter);
+
         locationIndicator = findViewById(R.id.locationIndicator);
         restartCounter = 0;
         mDeviceList = new ArrayList<>();
@@ -765,6 +830,9 @@ public class MainActivity extends AppCompatActivity {
 
         // Find the button by its ID
         Button myButton = findViewById(R.id.scanButton);
+        serialLoggingButton = findViewById(R.id.serialLogging);
+        serialLoggingButton.setEnabled(false);
+        serialLogging = false;
 
         // Set the click listener
         myButton.setOnClickListener(new View.OnClickListener() {
@@ -789,6 +857,24 @@ public class MainActivity extends AppCompatActivity {
                     }
                     Toast.makeText(MainActivity.this,
                             "Button Clicked: attempting to scan.", Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
+
+        // Set the click listener to initiate all sensor readings over serial!
+        serialLoggingButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (serialLogging) {
+                    serialLoggingButton.setText("start logging");
+                    serialLoggingButton.setBackgroundColor(Color.parseColor("#FF0000")); // sets background color to red
+                    serialLogging = false;
+                    stopLoggingAllSensors();
+                } else {
+                    serialLoggingButton.setText("stop logging");
+                    serialLoggingButton.setBackgroundColor(Color.parseColor("#00FF00")); // sets background color to red
+                    serialLogging = true;
+                    startLoggingAllSensors(false);
                 }
             }
         });
@@ -861,6 +947,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         closeGatt();
+        unregisterReceiver(usbPermissionReceiver);
     }
 
     public class AudioRecordThread extends Thread {
@@ -1006,4 +1093,233 @@ public class MainActivity extends AppCompatActivity {
                 locationCallback,
                 Looper.getMainLooper());
     }
+
+    public static class UsbSerialReceiver extends BroadcastReceiver {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if ("android.hardware.usb.action.USB_DEVICE_ATTACHED".equals(action)) {
+                // Routine executed when attaching a USB device.
+                UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                if (device != null) {
+                    // call method to set up device communication
+                    UsbManager usbManager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
+                    HashMap<String, UsbDevice> deviceList = usbManager.getDeviceList();
+                    for (UsbDevice d : deviceList.values()) {
+                        int vendorId = d.getVendorId();
+                        int productId = d.getProductId();
+                        Log.i("USB_DEVICE_INFO", "VID: " + vendorId + " PID: " + productId);
+                    }
+                    PendingIntent permissionIntent = PendingIntent.getBroadcast(context, 0, new Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_MUTABLE);
+                    usbManager.requestPermission(device, permissionIntent);
+                }
+            } else if ("android.hardware.usb.action.USB_DEVICE_DETACHED".equals(action)) {
+                // Routine executed when detaching the USB device.
+                UsbDevice detachedDevice = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                if (serialPort != null) {
+                    serialPort.close();
+                }
+                // If logging was still left on before USB unplugged, stop it by programmatically pressing the button.
+                serialLoggingButton.setEnabled(false);
+                // TODO this does not work and sometimes gets out of phase.
+                //if(serialLoggingButton.getText().toString().equals("start logging")) {
+                //    serialLoggingButton.performClick();
+                //}
+            }
+        }
+    }
+
+    UsbSerialInterface.UsbReadCallback mCallback = new UsbSerialInterface.UsbReadCallback() {
+        @Override
+        public void onReceivedData(byte[] arg0) {
+            // Convert bytes to string
+            if (serialLogging) {
+
+                String data = new String(arg0, StandardCharsets.UTF_8);
+                Log.i("SerialData", data);
+
+                String[] parts = data.trim().split("\\s+"); // Split the data by whitespace
+
+                int sensorId;
+
+                try {
+                    sensorId = Integer.parseInt(parts[0]);
+                } catch (NumberFormatException e) {
+                    // Handle invalid number format
+                    return;
+                }
+
+                // Only
+                if (parts.length >= 3 && sensorId == 1 || sensorId == 2) {
+                    long timestamp = System.currentTimeMillis();
+
+                    int firstSensorIndex;
+                    int readCounter;
+
+                    try {
+                        firstSensorIndex = Integer.parseInt(parts[2]);
+                        readCounter = Integer.parseInt(parts[1]);
+                    } catch (NumberFormatException e) {
+                        // Handle invalid number format
+                        return;
+                    }
+
+                    // Replace the sensor ID with a timestamp and create a CSV row.
+                    parts[0] = timestamp + "";
+                    // Merging the array back into a comma-separated string
+                    String row = String.join(", ", parts);
+
+
+                    Log.i("SerialRow", row);
+
+                    if (sensorId == 1) {
+                        rearSensorDataQueueSerial.offer(row);
+                    } else if (sensorId == 2) {
+                        sideSensorDataQueueSerial.offer(row);
+                    }
+
+                    // Since serial is so fast, just update every 10 reads.
+                    if (readCounter % 10 == 0) {
+                        // (Optional) Update the UI or handle the data as required
+                        // Remember, UI updates must be run on the main thread
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                // Update UI with data
+                                textView.setText(firstSensorIndex + ""); // Example if you have a TextView for display
+                            }
+                        });
+                    }
+
+                } else {
+                    // not a sensor reading.
+                }
+            }
+        }
+    };
+
+    BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (ACTION_USB_PERMISSION.equals(action)) {
+                synchronized (this) {
+                    UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+
+                    if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                        if(device != null){
+                            // Permission granted - setup the device
+                            Log.i("SERIAL", "Permission granted for device " + device);
+                            UsbManager usbManager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
+                            connection = usbManager.openDevice(device);
+                            if (connection != null) {
+                                serialPort = UsbSerialDevice.createUsbSerialDevice(device, connection);
+                                if (serialPort != null) {
+                                    if (serialPort.open()) {
+                                        // Set Serial Connection Parameters.
+                                        serialPort.setBaudRate(115200);
+                                        serialPort.setDataBits(UsbSerialInterface.DATA_BITS_8);
+                                        serialPort.setStopBits(UsbSerialInterface.STOP_BITS_1);
+                                        serialPort.setParity(UsbSerialInterface.PARITY_NONE);
+                                        serialPort.setFlowControl(UsbSerialInterface.FLOW_CONTROL_OFF);
+                                        serialPort.read(mCallback);
+                                        serialLoggingButton.setEnabled(true);
+                                    }
+                                }
+                            } else {
+                                Log.i("SERIAL", "SERIAL CONNECTION IS NULL...");
+                            }
+                        }
+                    } else {
+                        // Permission denied
+                        Log.i("SERIAL!", "permission defied for device: " + device);
+                    }
+                }
+            }
+        }
+    };
+
+
+
+    /*
+    UsbSerialInterface.UsbReadCallback mCallback = new UsbSerialInterface.UsbReadCallback() {
+        @Override
+        public void onReceivedData(byte[] arg0) {
+            // Convert bytes to string
+            String data = new String(arg0, StandardCharsets.UTF_8);
+
+            // Log the data
+            Log.d("SerialData", data);
+
+            // (Optional) Update the UI or handle the data as required
+            // Remember, UI updates must be run on the main thread
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    // Update UI with data
+                    textView.setText(data); // Example if you have a TextView for display
+                }
+            });
+        }
+    };
+
+    private final BroadcastReceiver broadcastReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
+                device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                if (device != null && !usbManager.hasPermission(device)) {
+                    usbManager.requestPermission(device, permissionIntent);
+                } else {
+                    Log.i("SERIAL", "Permission already granted");
+                }
+
+            } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
+                if (serialPort != null) {
+                    serialPort.close();
+                }
+            }
+        }
+    };
+
+    private final BroadcastReceiver usbPermissionReceiver = new BroadcastReceiver() {
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (ACTION_USB_PERMISSION.equals(action)) {
+                synchronized (this) {
+                    //UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                    if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                        if(device != null){
+                            Log.i("SERIAL", "Permission granted for device " + device);
+                            connection = usbManager.openDevice(device);
+                            if (connection != null) {
+                                serialPort = UsbSerialDevice.createUsbSerialDevice(device, connection);
+                                if (serialPort != null) {
+                                    if (serialPort.open()) {
+                                        // Set Serial Connection Parameters.
+                                        serialPort.setBaudRate(115200);
+                                        serialPort.setDataBits(UsbSerialInterface.DATA_BITS_8);
+                                        serialPort.setStopBits(UsbSerialInterface.STOP_BITS_1);
+                                        serialPort.setParity(UsbSerialInterface.PARITY_NONE);
+                                        serialPort.setFlowControl(UsbSerialInterface.FLOW_CONTROL_OFF);
+                                        serialPort.read(mCallback);
+                                    }
+                                }
+                            } else {
+                                Log.i("SERIAL", "SERIAL CONNECTION IS NULL...");
+                            }
+                        }
+                    }
+                    else {
+                        // Permission denied
+                        Log.d("USB", "permission denied for device " + device);
+                    }
+                }
+            }
+        }
+    };
+
+    */
+
+
 }
