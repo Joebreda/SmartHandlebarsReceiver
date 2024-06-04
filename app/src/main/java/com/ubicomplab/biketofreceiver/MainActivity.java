@@ -86,6 +86,7 @@ import com.google.android.gms.tasks.OnFailureListener;
 import com.google.android.gms.tasks.OnSuccessListener;
 import com.google.android.gms.tasks.Task;
 
+// requires 'https://jitpack.io' in settings.gradle.
 import com.felhr.usbserial.UsbSerialDevice;
 import com.felhr.usbserial.UsbSerialInterface;
 
@@ -704,7 +705,7 @@ public class MainActivity extends AppCompatActivity {
                 // Initialize your sensor event listener
                 this.sensorEventListener = new SensorEventWriter(this.bufferedWriter);
                 this.sensorManager.registerListener(this.sensorEventListener,
-                        this.sensor, this.sensorManager.SENSOR_DELAY_NORMAL, sensorHandler);
+                        this.sensor, SensorManager.SENSOR_DELAY_NORMAL, sensorHandler);
             } else {
                 Log.i("SENSOR!", sensorType + " NOT Available");
             }
