@@ -54,6 +54,7 @@
         android:id="@+id/textView"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
+        android:fontFamily="monospace"
         android:text="ToF reading"
         app:layout_constraintBottom_toTopOf="@id/locationIndicator"
         app:layout_constraintEnd_toEndOf="parent"

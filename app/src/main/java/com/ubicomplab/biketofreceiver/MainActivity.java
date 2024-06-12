@@ -77,7 +77,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 import com.google.android.gms.common.api.ResolvableApiException;
 import com.google.android.gms.location.FusedLocationProviderClient;
@@ -144,6 +146,10 @@ public class MainActivity extends AppCompatActivity {
     // Variables for controlling file writing for non-sensorManager streams.
     private ConcurrentLinkedQueue<Integer> rearSensorDataQueueBLE = new ConcurrentLinkedQueue<>();
     private ConcurrentLinkedQueue<Integer> sideSensorDataQueueBLE = new ConcurrentLinkedQueue<>();
+
+    private BlockingQueue<SensorReadingPacket> rearPacketQueueBLE = new LinkedBlockingQueue<>();
+    private BlockingQueue<SensorReadingPacket> sidePacketQueueBLE = new LinkedBlockingQueue<>();
+
     private ConcurrentLinkedQueue<String> rearSensorDataQueueSerial = new ConcurrentLinkedQueue<>();
     private ConcurrentLinkedQueue<String> sideSensorDataQueueSerial = new ConcurrentLinkedQueue<>();
     private ConcurrentLinkedQueue<String> locationQueue = new ConcurrentLinkedQueue<>();
@@ -166,12 +172,19 @@ public class MainActivity extends AppCompatActivity {
     private SensorLogger gyroscopeLogger;
     private Sensor magnetometer;
     private SensorLogger magnetometerLogger;
+    private Sensor lightSensor;
+    private SensorLogger lightSensorLogger;
 
     private TextView textView;
     private TextView locationIndicator;
     private volatile boolean keepRunning = true;
     DateTimeFormatter formatter;
     private int frame_mean = 0;
+    private int firstPayloadInt1 = 0;
+    private int firstPayloadInt2 = 0;
+    private long sensorTime1 = 0;
+    private long sensorTime2 = 0;
+    //private int[] rearSensorReading = int[]
 
     private LocationRequest locationRequest;
     private LocationCallback locationCallback;
@@ -359,6 +372,7 @@ public class MainActivity extends AppCompatActivity {
 
         restartCounter++;
 
+        lightSensorLogger.register(formattedDateTime);
         rotationSensorLogger.register(formattedDateTime);
         accelerometerLogger.register(formattedDateTime);
         gyroscopeLogger.register(formattedDateTime);
@@ -422,6 +436,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // Stop the file writing thread and reset the variable to null.
     private void stopLoggingAllSensors() {
         rearSensorFileWritingThread = stopFileWritingThread(rearSensorFileWritingThread);
         rearSensorDataQueueBLE.clear(); // Clear the data queue
@@ -430,6 +445,7 @@ public class MainActivity extends AppCompatActivity {
         sideSensorDataQueueBLE.clear(); // Clear the data queue
         sideSensorDataQueueSerial.clear(); // Clear the data queue
 
+        lightSensorLogger.close();
         rotationSensorLogger.close();
         accelerometerLogger.close();
         gyroscopeLogger.close();
@@ -452,8 +468,9 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
 
+                gatt.discoverServices();
                 // Request larger MTU size
-                //gatt.requestMtu(260);
+                gatt.requestMtu(24);
                 hasAttemptedReconnect = false;
                 reconnectionHandler.removeCallbacks(reconnectionTimeoutRunnable);
 
@@ -466,7 +483,6 @@ public class MainActivity extends AppCompatActivity {
 
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.i("BLE", "Disconnected from GATT server.");
-                // Stop the file writing thread and reset the variable to null.
                 stopLoggingAllSensors();
 
                 //closeGatt(); // Necessary to ensure only one bluetooth callback is registered at a time.
@@ -525,25 +541,42 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
+        // BLE PROTOCOL
         @Override
         public void onCharacteristicChanged(BluetoothGatt gatt,
                                             BluetoothGattCharacteristic characteristic) {
             if (MY_CHARACTERISTIC_UUID.equals(characteristic.getUuid())) {
                 byte[] data = characteristic.getValue();
-                long timestamp = System.currentTimeMillis();
+                long androidTime = System.currentTimeMillis();
 
-                int sensorIndex = data[0] & 0xFF;
-                int packetIndex = data[1] & 0xFF;
-                //int sensorIndex = (data[0] & 0xF0) >> 4;
-                //int packetIndex = data[0] & 0x0F;
-                int readCount = 0;
-                //int readCount = data[1] & 0xFF;
-                int firstPayloadInt = ((data[2] & 0xFF) << 8) | (data[3] & 0xFF);
+                //int sensorIndex = data[0] & 0xFF;
+                //int packetIndex = data[1] & 0xFF;
+                // Extract the sensorId and packetIndex from the first byte
+                int combined = data[0] & 0xFF;
+                int sensorIndex = (combined >> 4) & 0x0F;
+                int packetIndex = combined & 0x0F;
+                int readIndex = data[1] & 0xFF;
+                // Reconstruct the timestamp from the first 4 bytes
+                long peripheralTimestamp = ((data[2] & 0xFFL) << 24) |
+                        ((data[3] & 0xFFL) << 16) |
+                        ((data[4] & 0xFFL) << 8)  |
+                        (data[5] & 0xFFL);
 
-                Log.i("Received data", readCount + ": from sensor " + sensorIndex + " packet " + packetIndex + " at time " + timestamp + " first value was " + firstPayloadInt);
+                int payloadStartingIndex = 6; // was 2
+
+                // Grab a sample from the side and rear sensors for displaying on the screen.
+                if (sensorIndex == 1) {
+                    firstPayloadInt1 = ((data[payloadStartingIndex] & 0xFF) << 8) | (data[payloadStartingIndex + 1] & 0xFF);
+                    sensorTime1 = peripheralTimestamp;
+                } else if (sensorIndex == 2) {
+                    firstPayloadInt2 = ((data[payloadStartingIndex] & 0xFF) << 8) | (data[payloadStartingIndex + 1] & 0xFF);
+                    sensorTime2 = peripheralTimestamp;
+                }
+
+                Log.i("Received data length: " + data.length, "Sensor: " + sensorIndex + " packet " + packetIndex + " read index: " + readIndex + " at time " + androidTime + " peripheral timestamp was: " + peripheralTimestamp + " first value was rear: " + firstPayloadInt1 + " Side: " + firstPayloadInt2);
                 // Add received data to the respective queue
                 // Assume data.length is always even and > 2 for simplicity
-                for (int i = 2; i < data.length; i += 2) {
+                for (int i = payloadStartingIndex; i < data.length; i += 2) {
                     int value = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
                     if (sensorIndex == 1) {
                         rearSensorDataQueueBLE.offer(value);
@@ -559,13 +592,6 @@ public class MainActivity extends AppCompatActivity {
                     rearSensorDataQueueBLE.offer(endOfPacketMarker - packetIndex);
                     // TODO update this in the case that there are more than 2 packets per reading.
                     if (packetIndex == 1) {
-                        runOnUiThread(new Runnable() {
-                            @Override
-                            public void run() {
-                                // Update your TextView here
-                                textView.setText(firstPayloadInt + "");
-                            }
-                        });
                         rearSensorDataQueueBLE.offer(endOfReading);
                     }
                 } else if (sensorIndex == 2) {
@@ -574,9 +600,39 @@ public class MainActivity extends AppCompatActivity {
                         sideSensorDataQueueBLE.offer(endOfReading);
                     }
                 }
+                // Update UI with sensor reading.
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        // Format the readings to a fixed width of 4 characters
+                        String formattedRear = String.format("%4d", firstPayloadInt1);
+                        String formattedSide = String.format("%4d", firstPayloadInt2);
+                        String delay = String.format("%4d", sensorTime1 - sensorTime2);
+                        // Update your TextView here
+                        textView.setText("Rear: " + formattedRear + " side: " + formattedSide + " Delay " + delay);
+                    }
+                });
             }
         }
     };
+
+    public class SensorReadingPacket {
+        public int sensorIndex;
+        public int packetIndex;
+        public int readIndex;
+        public long peripheralTimestamp;
+        public long androidTimestamp;
+        public int[] payload;
+
+        public SensorReadingPacket(int sensorIndex, int packetIndex, int readIndex, long peripheralTimestamp, long androidTimestamp, int[] payload) {
+            this.sensorIndex = sensorIndex;
+            this.packetIndex = packetIndex;
+            this.readIndex = readIndex;
+            this.peripheralTimestamp = peripheralTimestamp;
+            this.androidTimestamp = androidTimestamp;
+            this.payload = payload;
+        }
+    }
 
     private boolean checkAndRequestPermissions() {
         String[] permissions = new String[]{
@@ -700,17 +756,23 @@ public class MainActivity extends AppCompatActivity {
                 Handler sensorHandler = new Handler(this.handlerThread.getLooper());
 
                 // Initialize BufferedWriter
-                //File file = new File(getExternalFilesDir(null), commonFileName + "_" + this.sensorType + ".csv");
+                File file = new File(getExternalFilesDir(null), commonFileName + "_" + this.sensorType + ".csv");
                 try {
-                    //this.bufferedWriter = new BufferedWriter(new FileWriter(file, true)); // 'true' to append
-                    this.bufferedWriter = createBufferedWriter(commonFileName + "_" + this.sensorType + ".csv");
+                    this.bufferedWriter = new BufferedWriter(new FileWriter(file, true)); // 'true' to append
+                    // TODO this is an alternative method for writing.
+                    //this.bufferedWriter = createBufferedWriter(commonFileName + "_" + this.sensorType + ".csv");
                 } catch (IOException e) {
                     e.printStackTrace();
                 }
                 // Initialize your sensor event listener
                 this.sensorEventListener = new SensorEventWriter(this.bufferedWriter);
-                this.sensorManager.registerListener(this.sensorEventListener,
-                        this.sensor, SensorManager.SENSOR_DELAY_NORMAL, sensorHandler);
+                if (this.sensorType.equals("light")) {
+                    this.sensorManager.registerListener(this.sensorEventListener,
+                            this.sensor, SensorManager.SENSOR_DELAY_FASTEST, sensorHandler);
+                } else {
+                    this.sensorManager.registerListener(this.sensorEventListener,
+                            this.sensor, SensorManager.SENSOR_DELAY_NORMAL, sensorHandler);
+                }
             } else {
                 Log.i("SENSOR!", sensorType + " NOT Available");
             }
@@ -816,6 +878,9 @@ public class MainActivity extends AppCompatActivity {
 
         // Initialize the IMU sensors.
         mySensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
+        lightSensor = mySensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
+        lightSensorLogger = new SensorLogger(
+                mySensorManager, lightSensor, "light");
         rotationSensor = mySensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
         rotationSensorLogger = new SensorLogger(
                 mySensorManager, rotationSensor, "rotation");
@@ -988,6 +1053,7 @@ public class MainActivity extends AppCompatActivity {
         super.onDestroy();
         closeGatt();
         unregisterReceiver(usbPermissionReceiver);
+        stopLoggingAllSensors();
     }
 
     public class AudioRecordThread extends Thread {
@@ -1169,6 +1235,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // SERIAL PROTOCOL
     UsbSerialInterface.UsbReadCallback mCallback = new UsbSerialInterface.UsbReadCallback() {
         @Override
         public void onReceivedData(byte[] arg0) {
