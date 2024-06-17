@@ -255,7 +255,8 @@ public class MainActivity extends AppCompatActivity {
         return fileWritingThread != null && fileWritingThread.isAlive();
     }
 
-    // Thread for writing bluetooth data only.
+
+    // This writer thread is used when the BLE callback queues data naively.
     // TODO change these outputFile to Uri fileUri
     private synchronized Thread startFileWritingThread(Thread thread,
                                                        ConcurrentLinkedQueue<Integer> queue,
@@ -279,17 +280,14 @@ public class MainActivity extends AppCompatActivity {
                     } else {
                         Log.i("in thread", "Queue.poll() was null....");
                     }
-
-                    if (value == Integer.MIN_VALUE) { // End of packet marker
-                        // Write the current line to file and start a new line
+                    // At the end of a given packet, write the stringBuilder contents and reset it.
+                    if (value == Integer.MIN_VALUE) {
                         writeLineToFile(csvLine.toString(), outputFile);
-                        //Log.i("ThreadName", threadName + "has data!");
                         csvLine = new StringBuilder();
                         long timestamp = System.currentTimeMillis();
                         csvLine.append(timestamp).append(",");
                         continue;
                     }
-
                     // Append value to the CSV line
                     csvLine.append(value).append(",");
                 }
@@ -306,7 +304,42 @@ public class MainActivity extends AppCompatActivity {
         return thread;
     }
 
-    // Thread for writing data which is passed to the concurrentLinkedQueue as a complete row including timestamp.
+    // This writer thread is used when the BLE callback packages packets into SensorReadingPacket.
+    private synchronized Thread startBLEPacketFileWritingThread(Thread thread,
+                                                       BlockingQueue<SensorReadingPacket> queue,
+                                                       File outputFile,
+                                                       String threadName) {
+        // if thread is already running just return it.
+        if (isFileWritingThreadRunning(thread)) {
+            return thread;
+        }
+        keepRunning = true;
+
+        thread = new Thread(() -> {
+            while (keepRunning) {
+                while (!queue.isEmpty()) {
+                    SensorReadingPacket packet = queue.poll();
+                    if (packet != null) {
+                        String row = packet.getAsCSVRow();
+                        writeLineToFile(row, outputFile);
+                    } else {
+                        Log.i("in thread", "Queue.poll() was null....");
+                    }
+                }
+
+                // Optional: Sleep a bit if queue is empty to reduce CPU usage
+                try {
+                    Thread.sleep(10); // Sleep for 10 milliseconds
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, threadName);
+        thread.start();
+        return thread;
+    }
+
+    // This writer thread is used when the Serial is used and data is queued as a complete string.
     private synchronized Thread startStringRowFileWritingThread(Thread thread,
                                                                 ConcurrentLinkedQueue<String> queue,
                                                                 File outputFile,
@@ -382,6 +415,8 @@ public class MainActivity extends AppCompatActivity {
         // TODO These file writing threads handle timestamping which is dumb. Should move this to .offer.
         if (overBLE) {
             // Register the side and rear ToF receivers over BLE communication.
+
+            /*
             if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
                 sideSensorFileWritingThread = startFileWritingThread(
                         sideSensorFileWritingThread, sideSensorDataQueueBLE,
@@ -392,6 +427,21 @@ public class MainActivity extends AppCompatActivity {
                         rearSensorFileWritingThread, rearSensorDataQueueBLE,
                         rearSensorOutputFile, "rearSensorThread" + restartCounter);
             }
+
+            */
+
+            if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
+                sideSensorFileWritingThread = startBLEPacketFileWritingThread(
+                        sideSensorFileWritingThread, rearPacketQueueBLE,
+                        sideSensorOutputFile, "sideSensorThread" + restartCounter);
+            }
+            if (!isFileWritingThreadRunning(rearSensorFileWritingThread)) {
+                rearSensorFileWritingThread = startBLEPacketFileWritingThread(
+                        rearSensorFileWritingThread, sidePacketQueueBLE,
+                        rearSensorOutputFile, "rearSensorThread" + restartCounter);
+            }
+
+
         } else {
             // Register the side and rear ToF receivers over Serial Connection.
             if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
@@ -441,6 +491,8 @@ public class MainActivity extends AppCompatActivity {
         rearSensorFileWritingThread = stopFileWritingThread(rearSensorFileWritingThread);
         rearSensorDataQueueBLE.clear(); // Clear the data queue
         rearSensorDataQueueSerial.clear(); // Clear the data queue
+        rearPacketQueueBLE.clear();
+        sidePacketQueueBLE.clear();
         sideSensorFileWritingThread = stopFileWritingThread(sideSensorFileWritingThread);
         sideSensorDataQueueBLE.clear(); // Clear the data queue
         sideSensorDataQueueSerial.clear(); // Clear the data queue
@@ -470,7 +522,8 @@ public class MainActivity extends AppCompatActivity {
 
                 gatt.discoverServices();
                 // Request larger MTU size
-                gatt.requestMtu(24);
+                boolean mtuRequested = gatt.requestMtu(24);
+                Log.i("BLE", "MTU size change requested: " + mtuRequested);
                 hasAttemptedReconnect = false;
                 reconnectionHandler.removeCallbacks(reconnectionTimeoutRunnable);
 
@@ -498,10 +551,11 @@ public class MainActivity extends AppCompatActivity {
         @Override
         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
             super.onMtuChanged(gatt, mtu, status);
+            Log.i("BLE", "onMtuChanged callback triggered");
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.i("ON MTU CHANGE", "SUCCESS!!!!");
+                Log.i("BLE", "MTU size changed successfully to " + mtu);
             } else {
-                Log.i("ON MTU CHANGE", "FAILURE....");
+                Log.e("BLE", "Failed to change MTU size, status: " + status);
             }
         }
 
@@ -541,7 +595,7 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        // BLE PROTOCOL
+        // BLE PROTOCOL // TODO BLE PROTOCOL AND SERIAL PROTOCOL USE DIFFERENT PACKET FORMATS RN...
         @Override
         public void onCharacteristicChanged(BluetoothGatt gatt,
                                             BluetoothGattCharacteristic characteristic) {
@@ -573,9 +627,29 @@ public class MainActivity extends AppCompatActivity {
                     sensorTime2 = peripheralTimestamp;
                 }
 
+                // Specifically for using packet data structure.
+
+                int[] payload = new int[(data.length - payloadStartingIndex) / 2];
+                for (int i = 0; i < payload.length; i++) {
+                    int index = payloadStartingIndex + i * 2;
+                    // Convert bytes in data to 16 bit integers.
+                    payload[i] = ((data[index] & 0xFF) << 8) | (data[index + 1] & 0xFF);
+                }
+                // TODO Will need to write logic to parse these objects.
+                SensorReadingPacket packet = new SensorReadingPacket(sensorIndex, packetIndex, readIndex, peripheralTimestamp, androidTime, payload);
+                if (sensorIndex == 1) {
+                    rearPacketQueueBLE.offer(packet);
+                } else if (sensorIndex == 2) {
+                    sidePacketQueueBLE.offer(packet);
+                }
+
+
+
                 Log.i("Received data length: " + data.length, "Sensor: " + sensorIndex + " packet " + packetIndex + " read index: " + readIndex + " at time " + androidTime + " peripheral timestamp was: " + peripheralTimestamp + " first value was rear: " + firstPayloadInt1 + " Side: " + firstPayloadInt2);
                 // Add received data to the respective queue
                 // Assume data.length is always even and > 2 for simplicity
+                // This is for queueing data sample by sample.
+                /*
                 for (int i = payloadStartingIndex; i < data.length; i += 2) {
                     int value = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
                     if (sensorIndex == 1) {
@@ -600,6 +674,9 @@ public class MainActivity extends AppCompatActivity {
                         sideSensorDataQueueBLE.offer(endOfReading);
                     }
                 }
+
+                */
+
                 // Update UI with sensor reading.
                 runOnUiThread(new Runnable() {
                     @Override
@@ -631,6 +708,21 @@ public class MainActivity extends AppCompatActivity {
             this.peripheralTimestamp = peripheralTimestamp;
             this.androidTimestamp = androidTimestamp;
             this.payload = payload;
+        }
+
+        public String getAsCSVRow() {
+            StringBuilder csvRow = new StringBuilder();
+            csvRow.append(sensorIndex).append(',')
+                    .append(packetIndex).append(',')
+                    .append(readIndex).append(',')
+                    .append(peripheralTimestamp).append(',')
+                    .append(androidTimestamp);
+
+            for (int value : payload) {
+                csvRow.append(',').append(value);
+            }
+
+            return csvRow.toString();
         }
     }
 
@@ -849,6 +941,7 @@ public class MainActivity extends AppCompatActivity {
 
         // Write logs to log file
         // TODO Uncomment if you need to debug serial connection code.
+        /*
         try {
             // Define the log file
             String filename = "zzz_logcat_" + System.currentTimeMillis() + ".txt";
@@ -859,6 +952,7 @@ public class MainActivity extends AppCompatActivity {
         } catch (IOException e) {
             e.printStackTrace();
         }
+        */
 
         IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
         registerReceiver(usbPermissionReceiver, filter);
@@ -1235,7 +1329,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // SERIAL PROTOCOL
+    // SERIAL PROTOCOL // TODO BLE PROTOCOL AND SERIAL PROTOCOL USE DIFFERENT PACKET FORMATS RN...
     UsbSerialInterface.UsbReadCallback mCallback = new UsbSerialInterface.UsbReadCallback() {
         @Override
         public void onReceivedData(byte[] arg0) {
