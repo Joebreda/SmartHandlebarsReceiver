@@ -19,36 +19,49 @@
         app:layout_constraintVertical_weight="1">
     </ListView>
 
+
     <EditText
         android:id="@+id/searchEditText"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
+        android:layout_marginTop="144dp"
+        android:hint="Search by name"
+        android:minHeight="48dp"
         app:layout_constraintBottom_toTopOf="@+id/scanButton"
-        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintEnd_toStartOf="@+id/connectionIndicator"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toTopOf="parent"
-        android:hint="Search by name" />
-
+        app:layout_constraintTop_toTopOf="parent" />
 
     <Button
         android:id="@+id/serialLogging"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="Start Serial"
-        app:layout_constraintTop_toBottomOf="@+id/scanButton"
+        app:layout_constraintBottom_toTopOf="@+id/enableSwitchBottom"
         app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHorizontal_bias="0.494"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintBottom_toTopOf="@+id/textView" />
+        app:layout_constraintTop_toBottomOf="@+id/scanButton" />
 
     <Button
         android:id="@+id/scanButton"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="BLE Scan"
-        app:layout_constraintBottom_toTopOf="@+id/textView"
+        app:layout_constraintBottom_toTopOf="@+id/serialLogging"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toBottomOf="@+id/searchEditText" />
+
+    <View
+        android:id="@+id/connectionIndicator"
+        android:layout_width="50dp"
+        android:layout_height="50dp"
+        android:layout_centerInParent="true"
+        android:background="@drawable/circle"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toEndOf="@+id/searchEditText"
+        app:layout_constraintTop_toBottomOf="@+id/deviceListView" />
 
     <TextView
         android:id="@+id/textView"
@@ -56,10 +69,11 @@
         android:layout_height="wrap_content"
         android:fontFamily="monospace"
         android:text="ToF reading"
-        app:layout_constraintBottom_toTopOf="@id/locationIndicator"
+        app:layout_constraintBottom_toTopOf="@+id/locationIndicator"
         app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHorizontal_bias="0.501"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toBottomOf="@+id/scanButton" />
+        app:layout_constraintTop_toBottomOf="@+id/audioSwitch" />
 
     <TextView
         android:id="@+id/locationIndicator"
@@ -68,8 +82,30 @@
         android:text="Location"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHorizontal_bias="0.498"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toBottomOf="@+id/textView"
-        app:layout_constraintVertical_bias="0.686" />
+        app:layout_constraintVertical_bias="0.098" />
+
+    <Button
+        android:id="@+id/enableSwitchBottom"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Enable Switch"
+        app:layout_constraintBottom_toTopOf="@+id/audioSwitch"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/serialLogging" />
+
+    <Switch
+        android:id="@+id/audioSwitch"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:minHeight="48dp"
+        android:text="Record Audio"
+        app:layout_constraintBottom_toTopOf="@+id/textView"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/enableSwitchBottom" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>

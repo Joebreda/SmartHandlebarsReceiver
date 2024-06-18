@@ -7,23 +7,19 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
-import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.PendingIntent;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
-import android.bluetooth.BluetoothGatt;
-import android.bluetooth.BluetoothGattCallback;
-import android.bluetooth.BluetoothGattCharacteristic;
-import android.bluetooth.BluetoothGattDescriptor;
-import android.bluetooth.BluetoothGattService;
-import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
+import android.bluetooth.le.ScanSettings;
 import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
@@ -50,12 +46,18 @@ import android.provider.MediaStore;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.util.Log;
+import android.view.Menu;
+import android.view.MenuInflater;
+import android.view.MenuItem;
 import android.view.View;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageButton;
 import android.widget.ListView;
+import android.widget.PopupMenu;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -66,20 +68,14 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.UUID;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 
 import com.google.android.gms.common.api.ResolvableApiException;
 import com.google.android.gms.location.FusedLocationProviderClient;
@@ -101,54 +97,33 @@ import com.felhr.usbserial.UsbSerialInterface;
 
 public class MainActivity extends AppCompatActivity {
 
+    boolean DEBUGGING_LOG_FILE = false;
     // Serial logic variables.
     public static final String ACTION_USB_PERMISSION = "com.ubicomplab.biketofreceiver.USB_PERMISSION";
     static UsbSerialDevice serialPort;
     UsbDeviceConnection connection;
     static Button serialLoggingButton;
     static Button bleScanButton;
+    static Button enableSwitchButton;
     boolean serialLogging;
+    boolean enableSwitchButtonPressed;
+    private Switch audioSwitch;
+    boolean recordAudio;
+    private View connectionIndicator;
+    private boolean bleConnected;
+    private boolean disconnectButtonPressed;
 
-    // BLE logic variables.
-    UUID MY_SERVICE_UUID = UUID.fromString("10336bc0-c8f9-4de7-b637-a68b7ef33fc9");
-    UUID MY_CHARACTERISTIC_UUID = UUID.fromString("43336bc0-c8f9-4de7-b637-a68b7ef33fc9");
-    // The fixed standard UUID for notifications.
-    UUID YOUR_DESCRIPTOR_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
+    // BLE adapter to list off BLE devices on screen.
     private BluetoothAdapter mBluetoothAdapter;
-    private BluetoothGatt mBluetoothGatt;
     private BluetoothLeScanner mBluetoothLeScanner;
     private List<BluetoothDevice> mDeviceList;  // List of devices to query using the clicked device name.
     private ArrayAdapter<String> mDeviceListAdapter;  // List of strings to display on the screen.
     private ListView mDeviceListView;
+    private List<BluetoothDevice> filteredDeviceList;
+    private String searchFilter;
     private boolean currentlyScanning = false;
     private String formattedDateTime;
-
-    // BLE reconnect attempt code.
-    private static final long INITIAL_RECONNECT_DELAY_MS = 1000; // 1 second
-    private static final int MAX_RECONNECT_ATTEMPTS = 5;
-    private long reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
-    private int reconnectAttempts = 0;
-
-    private boolean hasAttemptedReconnect = false;
-    private Handler reconnectionHandler = new Handler(Looper.getMainLooper());
-    private static final long RECONNECTION_TIMEOUT_MS = 5000; // 5 seconds
-    private Runnable reconnectionTimeoutRunnable = new Runnable() {
-        @Override
-        public void run() {
-            if (hasAttemptedReconnect) {
-                // Reconnection attempt timed out
-                closeGatt();
-            }
-        }
-    };
-
-    // Variables for controlling file writing for non-sensorManager streams.
-    private ConcurrentLinkedQueue<Integer> rearSensorDataQueueBLE = new ConcurrentLinkedQueue<>();
-    private ConcurrentLinkedQueue<Integer> sideSensorDataQueueBLE = new ConcurrentLinkedQueue<>();
-
-    private BlockingQueue<SensorReadingPacket> rearPacketQueueBLE = new LinkedBlockingQueue<>();
-    private BlockingQueue<SensorReadingPacket> sidePacketQueueBLE = new LinkedBlockingQueue<>();
 
     private ConcurrentLinkedQueue<String> rearSensorDataQueueSerial = new ConcurrentLinkedQueue<>();
     private ConcurrentLinkedQueue<String> sideSensorDataQueueSerial = new ConcurrentLinkedQueue<>();
@@ -176,15 +151,10 @@ public class MainActivity extends AppCompatActivity {
     private SensorLogger lightSensorLogger;
 
     private TextView textView;
+    private BroadcastReceiver updateReceiver;
     private TextView locationIndicator;
     private volatile boolean keepRunning = true;
     DateTimeFormatter formatter;
-    private int frame_mean = 0;
-    private int firstPayloadInt1 = 0;
-    private int firstPayloadInt2 = 0;
-    private long sensorTime1 = 0;
-    private long sensorTime2 = 0;
-    //private int[] rearSensorReading = int[]
 
     private LocationRequest locationRequest;
     private LocationCallback locationCallback;
@@ -193,27 +163,6 @@ public class MainActivity extends AppCompatActivity {
     private AudioRecordThread audioRecordThread;
 
     private static final int MULTIPLE_PERMISSIONS_REQUEST_CODE = 123;
-
-    private void handleReconnection(BluetoothGatt gatt) {
-        hasAttemptedReconnect = true;
-        // Attempt to reconnect
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            return;
-        }
-        boolean isReconnecting = gatt.connect();
-        Button button = findViewById(R.id.scanButton);
-        button.setBackgroundColor(Color.parseColor("#FFFF00")); // sets background color to Yellow
-        if (!isReconnecting) {
-            // If reconnection fails immediately, close GATT
-            closeGatt();
-        } else {
-            // Start a timeout for the reconnection attempt
-            reconnectionHandler.postDelayed(reconnectionTimeoutRunnable, RECONNECTION_TIMEOUT_MS);
-        }
-    }
-
-
-    // Code for writing location and BLE/Serial data to files.
 
     private Uri createMediaStoreUri(String fileName) {
         ContentResolver resolver = getContentResolver();
@@ -255,90 +204,6 @@ public class MainActivity extends AppCompatActivity {
         return fileWritingThread != null && fileWritingThread.isAlive();
     }
 
-
-    // This writer thread is used when the BLE callback queues data naively.
-    // TODO change these outputFile to Uri fileUri
-    private synchronized Thread startFileWritingThread(Thread thread,
-                                                       ConcurrentLinkedQueue<Integer> queue,
-                                                       File outputFile,
-                                                       String threadName) {
-        // if thread is already running just return it.
-        if (isFileWritingThreadRunning(thread)) {
-            return thread;
-        }
-        keepRunning = true;
-
-        thread = new Thread(() -> {
-            StringBuilder csvLine = new StringBuilder();
-            while (keepRunning) {
-                while (!queue.isEmpty()) {
-                    Integer polledValue = queue.poll();
-                    int value = -999;
-                    if (polledValue != null) {
-                        value = polledValue.intValue();
-                        // Process the value
-                    } else {
-                        Log.i("in thread", "Queue.poll() was null....");
-                    }
-                    // At the end of a given packet, write the stringBuilder contents and reset it.
-                    if (value == Integer.MIN_VALUE) {
-                        writeLineToFile(csvLine.toString(), outputFile);
-                        csvLine = new StringBuilder();
-                        long timestamp = System.currentTimeMillis();
-                        csvLine.append(timestamp).append(",");
-                        continue;
-                    }
-                    // Append value to the CSV line
-                    csvLine.append(value).append(",");
-                }
-
-                // Optional: Sleep a bit if queue is empty to reduce CPU usage
-                try {
-                    Thread.sleep(10); // Sleep for 10 milliseconds
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-        }, threadName);
-        thread.start();
-        return thread;
-    }
-
-    // This writer thread is used when the BLE callback packages packets into SensorReadingPacket.
-    private synchronized Thread startBLEPacketFileWritingThread(Thread thread,
-                                                       BlockingQueue<SensorReadingPacket> queue,
-                                                       File outputFile,
-                                                       String threadName) {
-        // if thread is already running just return it.
-        if (isFileWritingThreadRunning(thread)) {
-            return thread;
-        }
-        keepRunning = true;
-
-        thread = new Thread(() -> {
-            while (keepRunning) {
-                while (!queue.isEmpty()) {
-                    SensorReadingPacket packet = queue.poll();
-                    if (packet != null) {
-                        String row = packet.getAsCSVRow();
-                        writeLineToFile(row, outputFile);
-                    } else {
-                        Log.i("in thread", "Queue.poll() was null....");
-                    }
-                }
-
-                // Optional: Sleep a bit if queue is empty to reduce CPU usage
-                try {
-                    Thread.sleep(10); // Sleep for 10 milliseconds
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-        }, threadName);
-        thread.start();
-        return thread;
-    }
-
     // This writer thread is used when the Serial is used and data is queued as a complete string.
     private synchronized Thread startStringRowFileWritingThread(Thread thread,
                                                                 ConcurrentLinkedQueue<String> queue,
@@ -347,7 +212,6 @@ public class MainActivity extends AppCompatActivity {
         // if thread is already running just return it.
         if (isFileWritingThreadRunning(thread)) {
             return thread;
-            //return; // The thread is already running
         }
         keepRunning = true;
 
@@ -386,10 +250,8 @@ public class MainActivity extends AppCompatActivity {
         return null;
     }
 
-    public void startLoggingAllSensors(boolean overBLE) {
-        // Create a new output file to write to each time you reconnection.
-        LocalDateTime now = LocalDateTime.now();
-        formattedDateTime = now.format(formatter);
+    public void startLoggingAllSensors(boolean overBLE, String formattedDateTime) {
+        // Create a new output file to write to each time you reconnection using a global datetime.
         String rearFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_rear.csv";
         String sideFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_side.csv";
         String locationFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_location.csv";
@@ -398,7 +260,6 @@ public class MainActivity extends AppCompatActivity {
         rearSensorOutputFile = new File(rearFilename);
         sideSensorOutputFile = new File(sideFilename);
         locationOutputFile = new File(locationFilename);
-        frame_mean = 0;
 
         // TODO Instead of making an output file a more robust approach may be:
         //Uri fileUri = createMediaStoreUri("bluetooth_data.csv");
@@ -412,36 +273,8 @@ public class MainActivity extends AppCompatActivity {
         magnetometerLogger.register(formattedDateTime);
         audioFilePath = getExternalFilesDir(null) + "/" + formattedDateTime + "_audio.pcm";
 
-        // TODO These file writing threads handle timestamping which is dumb. Should move this to .offer.
         if (overBLE) {
-            // Register the side and rear ToF receivers over BLE communication.
-
-            /*
-            if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
-                sideSensorFileWritingThread = startFileWritingThread(
-                        sideSensorFileWritingThread, sideSensorDataQueueBLE,
-                        sideSensorOutputFile, "sideSensorThread" + restartCounter);
-            }
-            if (!isFileWritingThreadRunning(rearSensorFileWritingThread)) {
-                rearSensorFileWritingThread = startFileWritingThread(
-                        rearSensorFileWritingThread, rearSensorDataQueueBLE,
-                        rearSensorOutputFile, "rearSensorThread" + restartCounter);
-            }
-
-            */
-
-            if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
-                sideSensorFileWritingThread = startBLEPacketFileWritingThread(
-                        sideSensorFileWritingThread, rearPacketQueueBLE,
-                        sideSensorOutputFile, "sideSensorThread" + restartCounter);
-            }
-            if (!isFileWritingThreadRunning(rearSensorFileWritingThread)) {
-                rearSensorFileWritingThread = startBLEPacketFileWritingThread(
-                        rearSensorFileWritingThread, sidePacketQueueBLE,
-                        rearSensorOutputFile, "rearSensorThread" + restartCounter);
-            }
-
-
+            Log.i("logging", "logging over ble using service now.");
         } else {
             // Register the side and rear ToF receivers over Serial Connection.
             if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
@@ -456,25 +289,26 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
+        if (recordAudio) {
+            if (ActivityCompat.checkSelfPermission(getApplicationContext(),
+                    Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(MainActivity.this,
+                        new String[]{Manifest.permission.RECORD_AUDIO}, 5);
+            }
+            int bufferSize = AudioRecord.getMinBufferSize(
+                    44100,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT);
+            AudioRecord audioRecord = new AudioRecord(
+                    MediaRecorder.AudioSource.UNPROCESSED,//MediaRecorder.AudioSource.MIC,
+                    44100,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferSize);
 
-        if (ActivityCompat.checkSelfPermission(getApplicationContext(),
-                Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(MainActivity.this,
-                    new String[]{Manifest.permission.RECORD_AUDIO}, 5);
+            audioRecordThread = new AudioRecordThread(audioFilePath, audioRecord, bufferSize);
+            audioRecordThread.startRecording();
         }
-        int bufferSize = AudioRecord.getMinBufferSize(
-                44100,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT);
-        AudioRecord audioRecord = new AudioRecord(
-                MediaRecorder.AudioSource.UNPROCESSED,//MediaRecorder.AudioSource.MIC,
-                44100,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufferSize);
-
-        audioRecordThread = new AudioRecordThread(audioFilePath, audioRecord, bufferSize);
-        audioRecordThread.startRecording();
 
         startLocationUpdates();
 
@@ -486,15 +320,39 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // Disconnection dialog which is used to confirm whether user intends to disconnect.
+    private void showDisconnectDialog() {
+        new AlertDialog.Builder(this)
+                .setTitle("Disconnect")
+                .setMessage("Are you sure you want to disconnect?")
+                .setPositiveButton("Disconnect", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dialog, int which) {
+                        // Perform disconnection
+                        disconnectDevice();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void disconnectDevice() {
+        disconnectButtonPressed = true;
+        stopLoggingAllSensors();
+        // Stop the BLE service
+        Intent serviceIntent = new Intent(this, BleService.class);
+        stopService(serviceIntent);
+        connectionIndicator.setBackgroundColor(Color.RED);
+        bleScanButton.setEnabled(true);
+        bleScanButton.setText("Start Scanning");
+        enableSwitchButton.setEnabled(true);
+        bleConnected = false;
+    }
+
     // Stop the file writing thread and reset the variable to null.
     private void stopLoggingAllSensors() {
         rearSensorFileWritingThread = stopFileWritingThread(rearSensorFileWritingThread);
-        rearSensorDataQueueBLE.clear(); // Clear the data queue
         rearSensorDataQueueSerial.clear(); // Clear the data queue
-        rearPacketQueueBLE.clear();
-        sidePacketQueueBLE.clear();
         sideSensorFileWritingThread = stopFileWritingThread(sideSensorFileWritingThread);
-        sideSensorDataQueueBLE.clear(); // Clear the data queue
         sideSensorDataQueueSerial.clear(); // Clear the data queue
 
         lightSensorLogger.close();
@@ -502,198 +360,15 @@ public class MainActivity extends AppCompatActivity {
         accelerometerLogger.close();
         gyroscopeLogger.close();
         magnetometerLogger.close();
-
-        audioRecordThread.stopRecording();
+        if (recordAudio && audioRecordThread.isRecording) {
+            audioRecordThread.stopRecording();
+        }
 
         locationFileWritingThread = stopFileWritingThread(locationFileWritingThread);
         locationQueue.clear(); // Clear the data queue
     }
 
-    private final BluetoothGattCallback mGattCallback = new BluetoothGattCallback() {
-        @Override
-        public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.i("BLE", "Connected to GATT server.");
-                if (ActivityCompat.checkSelfPermission(MainActivity.this,
-                        Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                    handlePermissionsNotGranted(Manifest.permission.BLUETOOTH_CONNECT);
-                    return;
-                }
-
-                gatt.discoverServices();
-                // Request larger MTU size
-                boolean mtuRequested = gatt.requestMtu(24);
-                Log.i("BLE", "MTU size change requested: " + mtuRequested);
-                hasAttemptedReconnect = false;
-                reconnectionHandler.removeCallbacks(reconnectionTimeoutRunnable);
-
-                // Start logging all sensors!
-                startLoggingAllSensors(true);
-
-
-                mBluetoothGatt.discoverServices();
-                Log.i("BLE", "Attempting to start service discovery");
-
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                Log.i("BLE", "Disconnected from GATT server.");
-                stopLoggingAllSensors();
-
-                //closeGatt(); // Necessary to ensure only one bluetooth callback is registered at a time.
-                if (!hasAttemptedReconnect) {
-                    handleReconnection(gatt);
-                } else {
-                    closeGatt();
-                }
-
-            }
-        }
-
-        @Override
-        public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
-            super.onMtuChanged(gatt, mtu, status);
-            Log.i("BLE", "onMtuChanged callback triggered");
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.i("BLE", "MTU size changed successfully to " + mtu);
-            } else {
-                Log.e("BLE", "Failed to change MTU size, status: " + status);
-            }
-        }
-
-        @Override
-        public void onServicesDiscovered(BluetoothGatt gatt, int status) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.i("BLE", "GATT SUCCESS, looking for correct service and characteristic.");
-                Button button = findViewById(R.id.scanButton);
-                button.setBackgroundColor(Color.parseColor("#00FF00")); // sets background color to red
-                // Loop through available GATT Services and find your specific service & characteristic
-                for (BluetoothGattService gattService : gatt.getServices()) {
-                    if (gattService.getUuid().equals(MY_SERVICE_UUID)) {
-                        BluetoothGattCharacteristic characteristic =
-                                gattService.getCharacteristic(MY_CHARACTERISTIC_UUID);
-                        // Enable local notifications
-                        if (ActivityCompat.checkSelfPermission(
-                                MainActivity.this,
-                                Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                            handlePermissionsNotGranted(Manifest.permission.BLUETOOTH_CONNECT);
-                            return;
-                        }
-                        // Clear buffer anytime the connection is remade.
-                        //buffer.clear();
-                        // Start thread to process received bluetooth data into a file.
-                        //startFileWritingThread();
-                        gatt.setCharacteristicNotification(characteristic, true);
-                        // Enabled remote notifications
-                        BluetoothGattDescriptor desc = characteristic.getDescriptor(
-                                YOUR_DESCRIPTOR_UUID);
-                        desc.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                        gatt.writeDescriptor(desc);
-                        Log.i("BLE", "Wrote descriptor to enable notifications.");
-                    }
-                }
-            } else {
-                Log.w("BLE", "onServicesDiscovered received: " + status);
-            }
-        }
-
-        // BLE PROTOCOL // TODO BLE PROTOCOL AND SERIAL PROTOCOL USE DIFFERENT PACKET FORMATS RN...
-        @Override
-        public void onCharacteristicChanged(BluetoothGatt gatt,
-                                            BluetoothGattCharacteristic characteristic) {
-            if (MY_CHARACTERISTIC_UUID.equals(characteristic.getUuid())) {
-                byte[] data = characteristic.getValue();
-                long androidTime = System.currentTimeMillis();
-
-                //int sensorIndex = data[0] & 0xFF;
-                //int packetIndex = data[1] & 0xFF;
-                // Extract the sensorId and packetIndex from the first byte
-                int combined = data[0] & 0xFF;
-                int sensorIndex = (combined >> 4) & 0x0F;
-                int packetIndex = combined & 0x0F;
-                int readIndex = data[1] & 0xFF;
-                // Reconstruct the timestamp from the first 4 bytes
-                long peripheralTimestamp = ((data[2] & 0xFFL) << 24) |
-                        ((data[3] & 0xFFL) << 16) |
-                        ((data[4] & 0xFFL) << 8)  |
-                        (data[5] & 0xFFL);
-
-                int payloadStartingIndex = 6; // was 2
-
-                // Grab a sample from the side and rear sensors for displaying on the screen.
-                if (sensorIndex == 1) {
-                    firstPayloadInt1 = ((data[payloadStartingIndex] & 0xFF) << 8) | (data[payloadStartingIndex + 1] & 0xFF);
-                    sensorTime1 = peripheralTimestamp;
-                } else if (sensorIndex == 2) {
-                    firstPayloadInt2 = ((data[payloadStartingIndex] & 0xFF) << 8) | (data[payloadStartingIndex + 1] & 0xFF);
-                    sensorTime2 = peripheralTimestamp;
-                }
-
-                // Specifically for using packet data structure.
-
-                int[] payload = new int[(data.length - payloadStartingIndex) / 2];
-                for (int i = 0; i < payload.length; i++) {
-                    int index = payloadStartingIndex + i * 2;
-                    // Convert bytes in data to 16 bit integers.
-                    payload[i] = ((data[index] & 0xFF) << 8) | (data[index + 1] & 0xFF);
-                }
-                // TODO Will need to write logic to parse these objects.
-                SensorReadingPacket packet = new SensorReadingPacket(sensorIndex, packetIndex, readIndex, peripheralTimestamp, androidTime, payload);
-                if (sensorIndex == 1) {
-                    rearPacketQueueBLE.offer(packet);
-                } else if (sensorIndex == 2) {
-                    sidePacketQueueBLE.offer(packet);
-                }
-
-
-
-                Log.i("Received data length: " + data.length, "Sensor: " + sensorIndex + " packet " + packetIndex + " read index: " + readIndex + " at time " + androidTime + " peripheral timestamp was: " + peripheralTimestamp + " first value was rear: " + firstPayloadInt1 + " Side: " + firstPayloadInt2);
-                // Add received data to the respective queue
-                // Assume data.length is always even and > 2 for simplicity
-                // This is for queueing data sample by sample.
-                /*
-                for (int i = payloadStartingIndex; i < data.length; i += 2) {
-                    int value = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
-                    if (sensorIndex == 1) {
-                        rearSensorDataQueueBLE.offer(value);
-                    } else if (sensorIndex == 2) {
-                        sideSensorDataQueueBLE.offer(value);
-                    }
-                }
-
-                // Optionally, add a special marker to indicate packet end
-                int endOfPacketMarker = Integer.MAX_VALUE; // or some other value that won't conflict with actual data
-                int endOfReading = Integer.MIN_VALUE;
-                if (sensorIndex == 1) {
-                    rearSensorDataQueueBLE.offer(endOfPacketMarker - packetIndex);
-                    // TODO update this in the case that there are more than 2 packets per reading.
-                    if (packetIndex == 1) {
-                        rearSensorDataQueueBLE.offer(endOfReading);
-                    }
-                } else if (sensorIndex == 2) {
-                    sideSensorDataQueueBLE.offer(endOfPacketMarker - packetIndex);
-                    if (packetIndex == 1) {
-                        sideSensorDataQueueBLE.offer(endOfReading);
-                    }
-                }
-
-                */
-
-                // Update UI with sensor reading.
-                runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        // Format the readings to a fixed width of 4 characters
-                        String formattedRear = String.format("%4d", firstPayloadInt1);
-                        String formattedSide = String.format("%4d", firstPayloadInt2);
-                        String delay = String.format("%4d", sensorTime1 - sensorTime2);
-                        // Update your TextView here
-                        textView.setText("Rear: " + formattedRear + " side: " + formattedSide + " Delay " + delay);
-                    }
-                });
-            }
-        }
-    };
-
-    public class SensorReadingPacket {
+    public static class SensorReadingPacket {
         public int sensorIndex;
         public int packetIndex;
         public int readIndex;
@@ -763,19 +438,20 @@ public class MainActivity extends AppCompatActivity {
                 permission + "not granted. Discovered in permission check before function call.");
     }
 
-    private void filter(String text) {
-        List<BluetoothDevice> filteredList = new ArrayList<>();
+    private void filterDeviceList(String text) {
+        Log.i("Filtered device list", "filtered.");
+        filteredDeviceList.clear();
         List<String> filteredListNames = new ArrayList<>();
 
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            handlePermissionsNotGranted(Manifest.permission.BLUETOOTH_CONNECT);
+            return;
+        }
+
         for (BluetoothDevice device : mDeviceList) {
-            if (ActivityCompat.checkSelfPermission(this,
-                    Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                handlePermissionsNotGranted(Manifest.permission.BLUETOOTH_CONNECT);
-                return;
-            }
             if (device.getName() != null && device.getName().toLowerCase().contains(
                     text.toLowerCase())) {
-                filteredList.add(device);
+                filteredDeviceList.add(device);
                 filteredListNames.add(device.getName());
             }
         }
@@ -935,24 +611,22 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         checkAndRequestPermissions();
-
         String testfile = getExternalFilesDir(null) + "/" + formattedDateTime + "test.csv";
         Log.i("FILEPATH:", testfile + "");
 
         // Write logs to log file
-        // TODO Uncomment if you need to debug serial connection code.
-        /*
-        try {
-            // Define the log file
-            String filename = "zzz_logcat_" + System.currentTimeMillis() + ".txt";
-            File outputFile = new File(getExternalFilesDir(null), filename);
+        if (DEBUGGING_LOG_FILE) {
+            try {
+                // Define the log file
+                String filename = "zzz_logcat_" + System.currentTimeMillis() + ".txt";
+                File outputFile = new File(getExternalFilesDir(null), filename);
 
-            // Start the logcat process
-            Process process = Runtime.getRuntime().exec("logcat -f " + outputFile.getAbsolutePath());
-        } catch (IOException e) {
-            e.printStackTrace();
+                // Start the logcat process
+                Process process = Runtime.getRuntime().exec("logcat -f " + outputFile.getAbsolutePath());
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         }
-        */
 
         IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
         registerReceiver(usbPermissionReceiver, filter);
@@ -964,8 +638,10 @@ public class MainActivity extends AppCompatActivity {
         mDeviceListView = findViewById(R.id.deviceListView);
         mDeviceListView.setAdapter(mDeviceListAdapter);
         EditText searchEditText = findViewById(R.id.searchEditText);
+        searchFilter = "SMARTHANDLEBAR";
+        searchEditText.setText(searchFilter);
+        filteredDeviceList = new ArrayList<>();
 
-        LocalDateTime now = LocalDateTime.now();
         // Format it to a human-readable string
         formatter = DateTimeFormatter.ofPattern("dd-MM-yyyy_HH:mm:ss");
         textView = (TextView) findViewById(R.id.textView);
@@ -1002,7 +678,8 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void afterTextChanged(Editable s) {
-                filter(s.toString());
+                searchFilter = s.toString();
+                filterDeviceList(s.toString());
             }
         });
 
@@ -1010,13 +687,17 @@ public class MainActivity extends AppCompatActivity {
         mDeviceListView.setOnItemClickListener(new AdapterView.OnItemClickListener() {
             @Override
             public void onItemClick(AdapterView<?> parent, View view, int position, long id) {
-                BluetoothDevice device = mDeviceList.get(position);
+                Log.i("onItemClick", "Clicked device at position " + position);
+                //BluetoothDevice device = mDeviceList.get(position);
+                BluetoothDevice device = filteredDeviceList.get(position);
                 if (ActivityCompat.checkSelfPermission(MainActivity.this,
                         Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
                     handlePermissionsNotGranted(Manifest.permission.BLUETOOTH_SCAN);
                     return;
                 }
-                mBluetoothLeScanner.stopScan(mScanCallback);
+                //mBluetoothLeScanner.stopScan(mScanCallback);
+                stopScanning();
+                bleScanButton.setEnabled(false);
                 connectToDevice(device);
             }
         });
@@ -1029,32 +710,58 @@ public class MainActivity extends AppCompatActivity {
         serialLoggingButton = findViewById(R.id.serialLogging);
         serialLoggingButton.setEnabled(false);
         serialLogging = false;
+        enableSwitchButton = findViewById(R.id.enableSwitchBottom);
+        enableSwitchButtonPressed = false;
+        audioSwitch = findViewById(R.id.audioSwitch);
+        audioSwitch.setEnabled(false);
+        recordAudio = false;
+        connectionIndicator = findViewById(R.id.connectionIndicator);
+        bleConnected = false;
+        disconnectButtonPressed = false;
+
+        audioSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (isChecked) {
+                // Code to handle switch on
+                Toast.makeText(MainActivity.this, "Audio recording enabled", Toast.LENGTH_SHORT).show();
+                recordAudio = true;
+            } else {
+                // Code to handle switch off
+                Toast.makeText(MainActivity.this, "Audio recording disabled", Toast.LENGTH_SHORT).show();
+                recordAudio = false;
+            }
+            enableSwitchButtonPressed = false;
+            audioSwitch.setEnabled(false);
+        });
 
         // Set the click listener
         bleScanButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                // Check permissions and start scanning for BLE device.
-                if (currentlyScanning) {
-                    if (ActivityCompat.checkSelfPermission(MainActivity.this,
-                            Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-                        handlePermissionsNotGranted(Manifest.permission.BLUETOOTH_SCAN);
-                        return;
-                    }
-                    mBluetoothLeScanner.stopScan(mScanCallback);
-                    bleScanButton.setText("Start Scanning");
-                    currentlyScanning = false;
-
+                if (bleConnected) {
+                    showDisconnectDialog();
                 } else {
-                    if (isBluetoothEnabled()) {
-                        startScanning();
-                        bleScanButton.setText("Stop Scanning");
-                        currentlyScanning = true;
-                        Toast.makeText(MainActivity.this,
-                                "Button Clicked: attempting to scan.", Toast.LENGTH_SHORT).show();
+                    // Check permissions and start scanning for BLE device.
+                    if (currentlyScanning) {
+                        if (ActivityCompat.checkSelfPermission(MainActivity.this,
+                                Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                            handlePermissionsNotGranted(Manifest.permission.BLUETOOTH_SCAN);
+                            return;
+                        }
+                        bleScanButton.setText("Start Scanning");
+                        stopScanning();
+                        enableSwitchButton.setEnabled(true);
+
                     } else {
-                        Toast.makeText(MainActivity.this,
-                                "Bluetooth is OFF, please turn it on!", Toast.LENGTH_SHORT).show();
+                        if (isBluetoothEnabled()) {
+                            startScanning();
+                            bleScanButton.setText("Stop Scanning");
+                            currentlyScanning = true;
+                            Toast.makeText(MainActivity.this,
+                                    "Button Clicked: attempting to scan.", Toast.LENGTH_SHORT).show();
+                        } else {
+                            Toast.makeText(MainActivity.this,
+                                    "Bluetooth is OFF, please turn it on!", Toast.LENGTH_SHORT).show();
+                        }
                     }
                 }
             }
@@ -1066,17 +773,80 @@ public class MainActivity extends AppCompatActivity {
             public void onClick(View v) {
                 if (serialLogging) {
                     serialLoggingButton.setText("start logging");
-                    serialLoggingButton.setBackgroundColor(Color.parseColor("#FF0000")); // sets background color to red
+                    serialLoggingButton.setBackgroundColor(Color.parseColor("#FF0000")); // sets background color to Green
                     serialLogging = false;
                     stopLoggingAllSensors();
                 } else {
                     serialLoggingButton.setText("stop logging");
                     serialLoggingButton.setBackgroundColor(Color.parseColor("#00FF00")); // sets background color to red
                     serialLogging = true;
-                    startLoggingAllSensors(false);
+                    // Use the same start time for all files.
+                    LocalDateTime now = LocalDateTime.now();
+                    formattedDateTime = now.format(formatter);
+                    startLoggingAllSensors(false, formattedDateTime);
                 }
             }
         });
+
+        enableSwitchButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                // Check permissions and start scanning for BLE device.
+                if (enableSwitchButtonPressed) {
+                    enableSwitchButtonPressed = false;
+                    audioSwitch.setEnabled(false);
+                } else {
+                    enableSwitchButtonPressed = true;
+                    audioSwitch.setEnabled(true);
+
+                }
+            }
+        });
+
+        // Initialize and register the BroadcastReceiver to update UI elements based on BLE activity.
+        updateReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String action = intent.getAction();
+
+                if ("com.example.ACTION_UPDATE_UI".equals(action)) {
+                    int rearReading = intent.getIntExtra("rearReading", 0);
+                    int sideReading = intent.getIntExtra("sideReading", 0);
+                    long sensorTime1 = intent.getLongExtra("sensorTime1", 0);
+                    long sensorTime2 = intent.getLongExtra("sensorTime2", 0);
+
+                    // Format the readings to a fixed width of 4 characters
+                    String formattedRear = String.format("%4d", rearReading);
+                    String formattedSide = String.format("%4d", sideReading);
+                    String delay = String.format("%4d", sensorTime1 - sensorTime2);
+                    textView.setText("Rear: " + formattedRear + " side: " + formattedSide + " Delay " + delay);
+                } else if ("com.example.ACTION_RECONNECTING".equals(action)) {
+                    //bleScanButton.setBackgroundColor(Color.parseColor("#FFFF00")); // sets background color to Yellow
+                    connectionIndicator.setBackgroundColor(Color.YELLOW);
+                    bleConnected = false;
+                } else if ("com.example.ACTION_DISCONNECTED".equals(action)) {
+                    //bleScanButton.setBackgroundColor(Color.parseColor("#FF0000")); // sets background color to red
+                    connectionIndicator.setBackgroundColor(Color.RED);
+                    bleScanButton.setEnabled(true);
+                    bleScanButton.setText("Start Scanning");
+                    enableSwitchButton.setEnabled(true);
+                    bleConnected = false;
+                    if (!disconnectButtonPressed)
+                    stopLoggingAllSensors();
+                } else if ("com.example.ACTION_CONNECTED".equals(action)) {
+                    connectionIndicator.setBackgroundColor(Color.GREEN);
+                    bleScanButton.setText("Disconnect");
+                    bleScanButton.setEnabled(true);
+                    bleConnected = true;
+                }
+            }
+        };
+        IntentFilter updateUIFilter = new IntentFilter("com.example.ACTION_UPDATE_UI");
+        updateUIFilter.addAction("com.example.ACTION_CONNECTED");
+        updateUIFilter.addAction("com.example.ACTION_DISCONNECTED");
+        updateUIFilter.addAction("com.example.ACTION_RECONNECTING");
+        registerReceiver(updateReceiver, updateUIFilter);
+
     }
 
     private ScanCallback mScanCallback = new ScanCallback() {
@@ -1094,24 +864,57 @@ public class MainActivity extends AppCompatActivity {
                 mDeviceListAdapter.add(device.getName());
                 // Not sure if this is necessary.
                 mDeviceListAdapter.notifyDataSetChanged();
+                // Upon change to the device list, filter the device list for what is in search bar.
+                filterDeviceList(searchFilter);
+                Log.i("onScanResult", "added and Filtered scan results");
+                for (int i = 0; i < mDeviceList.toArray().length; i++) {
+                    BluetoothDevice printDevice = mDeviceList.get(i);
+                    Log.i("onScanResult", "Device: " + printDevice.getName() + " position: " + i);
+                }
 
             }
         }
+
+        @Override
+        public void onScanFailed(int errorCode) {
+            super.onScanFailed(errorCode);
+            Log.i("BLEScan", "Scan Failed!");
+        }
     };
 
-
+    // Initiate scanning to find BLE device and connect.
     private void startScanning() {
         if (ContextCompat.checkSelfPermission(this,
                 Manifest.permission.BLUETOOTH_ADMIN) == PackageManager.PERMISSION_GRANTED &&
                 ContextCompat.checkSelfPermission(this,
                         Manifest.permission.ACCESS_FINE_LOCATION
                 ) == PackageManager.PERMISSION_GRANTED) {
-            mBluetoothLeScanner.startScan(mScanCallback);
+
+            // Scan settings allow for higher throughput on BLE.
+            ScanSettings scanSettings = new ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .build();
+
+            // Start the BLE scanner.
+            mBluetoothLeScanner.startScan(null, scanSettings, mScanCallback);
         } else {
             ActivityCompat.requestPermissions(this,
                     new String[]{Manifest.permission.BLUETOOTH_ADMIN,
                             Manifest.permission.ACCESS_FINE_LOCATION}, 1);
         }
+    }
+
+    private void stopScanning() {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        mBluetoothLeScanner.stopScan(mScanCallback);
+        // Clear the device list and notify the adapter
+        mDeviceList.clear();
+        mDeviceListAdapter.clear();
+        mDeviceListAdapter.notifyDataSetChanged();
+        bleScanButton.setText("Start Scanning");
+        currentlyScanning = false;
     }
 
 
@@ -1121,33 +924,30 @@ public class MainActivity extends AppCompatActivity {
             handlePermissionsNotGranted(android.Manifest.permission.BLUETOOTH_CONNECT);
             return;
         }
-        mBluetoothGatt = device.connectGatt(this, false, mGattCallback);
-        // Further operations will be done in the BluetoothGattCallback
-
-        // Request high priority connection to potentially reduce the connection interval
-        mBluetoothGatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
-    }
-
-    private void closeGatt() {
-        if (mBluetoothGatt != null) {
-            if (ActivityCompat.checkSelfPermission(this,
-                    Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                handlePermissionsNotGranted(Manifest.permission.BLUETOOTH_CONNECT);
-                return;
-            }
-            mBluetoothGatt.close();
-            Button button = findViewById(R.id.scanButton);
-            button.setBackgroundColor(Color.parseColor("#FF0000")); // sets background color to red
-            mBluetoothGatt = null;
+        // Starts bluetooth service using the device selected.
+        if (device != null) {
+            Intent serviceIntent = new Intent(this, BleService.class);
+            enableSwitchButton.setEnabled(false);
+            LocalDateTime now = LocalDateTime.now();
+            formattedDateTime = now.format(formatter);
+            serviceIntent.putExtra("BluetoothDevice", device);
+            serviceIntent.putExtra("startTime", formattedDateTime);
+            startService(serviceIntent);
+            startLoggingAllSensors(true, formattedDateTime);
         }
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        closeGatt();
+        // TODO moved to service!
+        //closeGatt();
         unregisterReceiver(usbPermissionReceiver);
         stopLoggingAllSensors();
+        unregisterReceiver(updateReceiver);
+        // Stop the BLE service
+        Intent serviceIntent = new Intent(this, BleService.class);
+        stopService(serviceIntent);
     }
 
     public class AudioRecordThread extends Thread {
@@ -1185,7 +985,6 @@ public class MainActivity extends AppCompatActivity {
                 byte[] audioData = new byte[bufferSize];
 
                 while (isRecording) {
-                    //Log.i("audio record thread", "running");
                     int read = audioRecord.read(audioData, 0, bufferSize);
                     if (read > 0) {
                         fos.write(audioData, 0, read);
@@ -1239,8 +1038,6 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        //Toast.makeText(getApplicationContext(), "Starting Location Updates!", Toast.LENGTH_SHORT).show();
-
         Log.i("LOCATION", "Starting location requests.");
 
         // TODO: Maybe move this to on create?
@@ -1265,7 +1062,6 @@ public class MainActivity extends AppCompatActivity {
                         }
                         locationIndicator.setText(locationString);
                         Log.i("LOCATION", "Got a location at " + latitude + " " + longitude);
-                        //Toast.makeText(getApplicationContext(), "LocationCallback SUCCESS!", Toast.LENGTH_SHORT).show();
                     }
                 }
             }
@@ -1277,13 +1073,6 @@ public class MainActivity extends AppCompatActivity {
             if (ActivityCompat.checkSelfPermission(this,
                     Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(
                     this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                // TODO: Consider calling
-                //    ActivityCompat#requestPermissions
-                // here to request the missing permissions, and then overriding
-                //   public void onRequestPermissionsResult(int requestCode, String[] permissions,
-                //                                          int[] grantResults)
-                // to handle the case where the user grants the permission. See the documentation
-                // for ActivityCompat#requestPermissions for more details.
                 Log.i("LOCATION", "Could not get permission.");
                 return;
             }
