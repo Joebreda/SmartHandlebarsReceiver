@@ -104,8 +104,18 @@
         android:minHeight="48dp"
         android:text="Record Audio"
         app:layout_constraintBottom_toTopOf="@+id/textView"
-        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintEnd_toStartOf="@+id/uploadData"
         app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/enableSwitchBottom" />
+
+    <Button
+        android:id="@+id/uploadData"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="upload data"
+        app:layout_constraintBottom_toTopOf="@+id/textView"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toEndOf="@+id/audioSwitch"
         app:layout_constraintTop_toBottomOf="@+id/enableSwitchBottom" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>

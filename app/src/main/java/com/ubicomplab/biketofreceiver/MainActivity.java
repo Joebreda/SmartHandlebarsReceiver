@@ -36,6 +36,7 @@ import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.net.Uri;
+import android.os.AsyncTask;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
@@ -46,6 +47,7 @@ import android.provider.MediaStore;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.util.Log;
+import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
@@ -55,14 +57,17 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageButton;
+import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.PopupMenu;
+import android.widget.ProgressBar;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.BufferedWriter;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -75,6 +80,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import com.google.android.gms.common.api.ResolvableApiException;
@@ -95,11 +102,37 @@ import com.google.android.gms.tasks.Task;
 import com.felhr.usbserial.UsbSerialDevice;
 import com.felhr.usbserial.UsbSerialInterface;
 
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.MediaType;
+import okhttp3.MultipartBody;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+
 public class MainActivity extends AppCompatActivity {
 
     boolean DEBUGGING_LOG_FILE = false;
     // Serial logic variables.
     public static final String ACTION_USB_PERMISSION = "com.ubicomplab.biketofreceiver.USB_PERMISSION";
+
+    // Server communication variables.
+    private static final String serverURL = "https://homes.cs.washington.edu/~joebreda/web_server/"; //"http://10.19.127.111:8080/upload";
+    private OkHttpClient httpUserClient = new OkHttpClient();
+    private boolean cancelUpload = false;
+    private int currentFileIndex = 0;
+    private int chunksSent = 0;
+    private File[] filesToUpload;
+    private Map<String, TextView> fileTextViewMap = new HashMap<>();
+    private ProgressBar progressBar;
+    private AlertDialog dialog;
+    private LinearLayout fileListLayout;
+
     static UsbSerialDevice serialPort;
     UsbDeviceConnection connection;
     static Button serialLoggingButton;
@@ -112,6 +145,9 @@ public class MainActivity extends AppCompatActivity {
     private View connectionIndicator;
     private boolean bleConnected;
     private boolean disconnectButtonPressed;
+    static Button uploadDataButton;
+    Button cancelSendDataButton;
+    Button sendDataButton;
 
 
     // BLE adapter to list off BLE devices on screen.
@@ -345,7 +381,328 @@ public class MainActivity extends AppCompatActivity {
         bleScanButton.setEnabled(true);
         bleScanButton.setText("Start Scanning");
         enableSwitchButton.setEnabled(true);
+        uploadDataButton.setEnabled(true);
         bleConnected = false;
+    }
+
+    private void showFilePopup() {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        LayoutInflater inflater = getLayoutInflater();
+        View dialogView = inflater.inflate(R.layout.file_popup, null);
+        builder.setView(dialogView);
+
+        fileListLayout = dialogView.findViewById(R.id.fileListLayout);
+        progressBar = dialogView.findViewById(R.id.progressBar);
+        cancelSendDataButton = dialogView.findViewById(R.id.cancelButton);
+        sendDataButton = dialogView.findViewById(R.id.sendButton);
+        sendDataButton.setEnabled(false);
+
+        dialog = builder.create();
+
+        cancelSendDataButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                cancelUpload = true;
+                dialog.dismiss();
+            }
+        });
+
+        sendDataButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                progressBar.setVisibility(View.VISIBLE);
+                cancelUpload = false;
+                File dir = new File("/storage/emulated/0/Android/data/com.ubicomplab.biketofreceiver/files/");
+                if (dir.exists() && dir.isDirectory()) {
+                    filesToUpload = dir.listFiles();
+                    Log.i("Number of files to upload before filtering", "" + filesToUpload.length);
+                    filesToUpload = filterFilesToUpload(dir.listFiles(), fileTextViewMap.keySet());
+                    Log.i("Number of files to upload after filtering", "" + filesToUpload.length);
+                    if (filesToUpload != null && filesToUpload.length > 0) {
+                        currentFileIndex = 0;
+                        sendNextFile(); // Start sending files
+                    }
+                }
+            }
+        });
+
+        dialog.show();
+
+        new LoadFilesTask().execute();
+    }
+
+    private File[] filterFilesToUpload(File[] allFiles, Set<String> validFileNames) {
+        List<File> filteredFiles = new ArrayList<>();
+        for (File file : allFiles) {
+            if (validFileNames.contains(file.getName())) {
+                filteredFiles.add(file);
+            }
+        }
+        return filteredFiles.toArray(new File[0]);
+    }
+
+    private void sendNextFile() {
+        if (cancelUpload || currentFileIndex >= filesToUpload.length) {
+            progressBar.setVisibility(View.GONE);
+            updateSendButtonToDone();
+            return;
+        }
+
+        File file = filesToUpload[currentFileIndex];
+        String fileName = file.getName();
+
+        // Check if the file is empty
+        if (file.length() == 0) {
+            Log.i("Skipping file", "File " + fileName + " is empty.");
+            TextView fileTextView = fileTextViewMap.get(file.getName());
+            if (fileTextView != null) {
+                fileTextView.setTextColor(Color.BLUE);
+            }
+            currentFileIndex++;
+            sendNextFile(); // Skip this file and send the next one
+            return;
+        }
+
+        // Check if the file extension is .csv
+        if (!fileName.endsWith(".csv")) {
+            Log.i("Skipping file", "File " + fileName + " is not a CSV file.");
+            TextView fileTextView = fileTextViewMap.get(file.getName());
+            if (fileTextView != null) {
+                fileTextView.setTextColor(Color.RED);
+            }
+            currentFileIndex++;
+            sendNextFile(); // Skip this file and send the next one
+            return;
+        }
+
+        Log.i("Sending file", "fileName: " + fileName);
+
+        sendFileInChunks(file, new FileUploadCallback() {
+            @Override
+            public void onSuccess() {
+                runOnUiThread(() -> {
+                    Log.i("sending file", "success!");
+                    TextView fileTextView = fileTextViewMap.get(file.getName());
+                    if (fileTextView != null) {
+                        fileTextView.setTextColor(Color.GREEN);
+                    }
+                    currentFileIndex++;
+                    chunksSent++;
+                    Log.i("CURRENT FILE INDEX NUMBER", "" + currentFileIndex + " CHUNKS: " + chunksSent);
+                    sendNextFile(); // Send the next file
+                });
+            }
+
+            @Override
+            public void onFailure(String errorMessage) {
+                runOnUiThread(() -> {
+                    Log.i("sending file", "FAILED!");
+                    progressBar.setVisibility(View.GONE);
+                    showMessage("Upload failed: " + errorMessage);
+                });
+            }
+        });
+    }
+
+    private void sendFileInChunks(File file, FileUploadCallback callback) {
+        final long chunkSize = 1 * 1024 * 1024; // 1 MB
+        long fileSize = file.length();
+        final int totalChunks = (int) Math.ceil((double) fileSize / chunkSize);
+
+        try (FileInputStream fis = new FileInputStream(file)) {
+            byte[] buffer = new byte[(int) chunkSize];
+            int chunkNumber = 1;
+            int bytesRead;
+
+            while ((bytesRead = fis.read(buffer)) != -1) {
+                if (cancelUpload) {
+                    progressBar.setVisibility(View.GONE);
+                    return;
+                }
+
+                // Create a new file with the chunk data
+                File chunkFile = new File(getCacheDir(), file.getName() + "_chunk_" + chunkNumber);
+                try (FileOutputStream fos = new FileOutputStream(chunkFile)) {
+                    fos.write(buffer, 0, bytesRead);
+                }
+
+                // Send the chunk
+                sendFileChunk(chunkFile, chunkNumber, totalChunks, file.getName(), callback);
+
+                // Increment chunk number
+                chunkNumber++;
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+            showMessage("Error reading file: " + e.getMessage());
+            callback.onFailure(e.getMessage());
+        }
+    }
+
+    private void sendFileChunk(File chunkFile, int chunkNumber, int totalChunks, String originalFileName, FileUploadCallback callback) {
+        Log.i("SendFileChunk", "Sending chunk " + chunkNumber + " of " + totalChunks + " for file " + originalFileName);
+
+        RequestBody requestBody = new MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("file", chunkFile.getName(),
+                        RequestBody.create(chunkFile, MediaType.parse("text/plain")))
+                .addFormDataPart("chunk_number", String.valueOf(chunkNumber))
+                .addFormDataPart("total_chunks", String.valueOf(totalChunks))
+                .addFormDataPart("file_name", originalFileName)
+                .build();
+
+        Request request = new Request.Builder()
+                .url(serverURL)
+                .post(requestBody)
+                .build();
+
+        httpUserClient.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                runOnUiThread(() -> {
+                    progressBar.setVisibility(View.GONE);
+                    Log.e("Upload failed", "Error: " + e.getMessage());
+                    showMessage("Upload failed: " + e.getMessage());
+                    callback.onFailure(e.getMessage());
+                });
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                try {
+                    String responseBody = response.body().string();
+                    Log.i("Upload response", responseBody);
+                    if (response.isSuccessful()) {
+                        runOnUiThread(() -> {
+                            chunkFile.delete(); // Delete the chunk file after successful upload
+                            Log.i("Upload success", "Chunk " + chunkNumber + " uploaded successfully.");
+                            if (chunkNumber == totalChunks) {
+                                callback.onSuccess();
+                            }
+                        });
+                    } else {
+                        runOnUiThread(() -> {
+                            progressBar.setVisibility(View.GONE);
+                            Log.e("Upload failed", "Response: " + responseBody);
+                            showMessage("Upload failed: " + responseBody);
+                            callback.onFailure(responseBody);
+                        });
+                    }
+                } finally {
+                    response.close(); // Ensure the response body is closed
+                }
+            }
+        });
+    }
+
+
+    private class LoadFilesTask extends AsyncTask<Void, Void, List<String>> {
+        @Override
+        protected void onPreExecute() {
+            super.onPreExecute();
+            progressBar.setVisibility(View.VISIBLE);
+        }
+
+        @Override
+        protected List<String> doInBackground(Void... voids) {
+            List<String> localFileNames = getLocalCSVFiles();
+            List<String> serverFileNames = getServerFiles();
+
+            localFileNames.removeAll(serverFileNames); // Filter out files that are already on the server
+
+            return localFileNames;
+        }
+
+        @Override
+        protected void onPostExecute(List<String> fileNames) {
+            super.onPostExecute(fileNames);
+            progressBar.setVisibility(View.GONE);
+            for (String fileName : fileNames) {
+                TextView fileTextView = new TextView(MainActivity.this);
+                fileTextView.setText(fileName);
+                fileListLayout.addView(fileTextView);
+                fileTextViewMap.put(fileName, fileTextView);
+            }
+            // After checking server and populating list, enable send data button with list of files.
+            sendDataButton.setEnabled(true);
+        }
+
+        private List<String> getLocalCSVFiles() {
+            List<String> fileNames = new ArrayList<>();
+            File dir = new File("/storage/emulated/0/Android/data/com.ubicomplab.biketofreceiver/files/");
+            if (dir.exists() && dir.isDirectory()) {
+                File[] files = dir.listFiles();
+                if (files != null) {
+                    for (File file : files) {
+                        if (file.getName().endsWith(".csv")) {
+                            fileNames.add(file.getName());
+                        }
+                    }
+                }
+            }
+            return fileNames;
+        }
+
+        private List<String> getServerFiles() {
+            OkHttpClient client = new OkHttpClient();
+            String listFilesGetURL = serverURL + "?list_files=true"; //"https://homes.cs.washington.edu/~joebreda/web_server/?list_files=true";
+
+            Request request = new Request.Builder()
+                    .url(listFilesGetURL)
+                    .get()
+                    .build();
+
+            try {
+                Response response = client.newCall(request).execute();
+                if (response.isSuccessful()) {
+                    String responseBody = response.body().string();
+                    JSONArray files = new JSONArray(responseBody);
+
+                    List<String> fileNames = new ArrayList<>();
+                    for (int i = 0; i < files.length(); i++) {
+                        fileNames.add(files.getString(i));
+                    }
+
+                    response.close();
+                    return fileNames;
+                } else {
+                    response.close();
+                }
+            } catch (IOException | JSONException e) {
+                Log.e("getServerFiles", "Error fetching server files", e);
+            }
+
+            return new ArrayList<>();
+        }
+    }
+
+    private interface FileUploadCallback {
+        void onSuccess();
+        void onFailure(String errorMessage);
+    }
+
+    private void showMessage(String message) {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setMessage(message)
+                .setPositiveButton("OK", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        dialog.dismiss();
+                    }
+                });
+        builder.create().show();
+    }
+
+    private void updateSendButtonToDone() {
+        runOnUiThread(() -> {
+            sendDataButton.setText("Done");
+            sendDataButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    dialog.dismiss();
+                }
+            });
+        });
     }
 
     // Stop the file writing thread and reset the variable to null.
@@ -718,6 +1075,7 @@ public class MainActivity extends AppCompatActivity {
         connectionIndicator = findViewById(R.id.connectionIndicator);
         bleConnected = false;
         disconnectButtonPressed = false;
+        uploadDataButton = findViewById(R.id.uploadData);
 
         audioSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
             if (isChecked) {
@@ -750,11 +1108,13 @@ public class MainActivity extends AppCompatActivity {
                         bleScanButton.setText("Start Scanning");
                         stopScanning();
                         enableSwitchButton.setEnabled(true);
+                        uploadDataButton.setEnabled(true);
 
                     } else {
                         if (isBluetoothEnabled()) {
                             startScanning();
                             bleScanButton.setText("Stop Scanning");
+                            uploadDataButton.setEnabled(false);
                             currentlyScanning = true;
                             Toast.makeText(MainActivity.this,
                                     "Button Clicked: attempting to scan.", Toast.LENGTH_SHORT).show();
@@ -803,6 +1163,13 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        uploadDataButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showFilePopup();
+            }
+        });
+
         // Initialize and register the BroadcastReceiver to update UI elements based on BLE activity.
         updateReceiver = new BroadcastReceiver() {
             @Override
@@ -830,6 +1197,7 @@ public class MainActivity extends AppCompatActivity {
                     bleScanButton.setEnabled(true);
                     bleScanButton.setText("Start Scanning");
                     enableSwitchButton.setEnabled(true);
+                    uploadDataButton.setEnabled(true);
                     bleConnected = false;
                     if (!disconnectButtonPressed)
                     stopLoggingAllSensors();
