@@ -56,6 +56,8 @@ public class BleService extends Service {
     private int firstPayloadInt2 = 0;
     private long sensorTime1 = 0;
     private long sensorTime2 = 0;
+    private int previousPacketIndex = -1; // Initialize to an invalid index
+    private long previouspacketTimestamp = -1; // Initialize to an invalid index
 
     private volatile boolean keepRunning = true;
     DateTimeFormatter formatter;
@@ -293,6 +295,8 @@ public class BleService extends Service {
                         (data[5] & 0xFFL);
 
                 int payloadStartingIndex = 6;
+                int packetMissed = -1;
+                long currentPacketDelay = -1;
 
                 if (sensorIndex == 1) {
                     firstPayloadInt1 = ((data[payloadStartingIndex] & 0xFF) << 8) | (data[payloadStartingIndex + 1] & 0xFF);
@@ -308,7 +312,23 @@ public class BleService extends Service {
                     payload[i] = ((data[index] & 0xFF) << 8) | (data[index + 1] & 0xFF);
                 }
 
-                Log.i("Received data length: " + data.length, "Sensor: " + sensorIndex + " packet " + packetIndex + " read index: " + readIndex + " at time " + androidTime + " peripheral timestamp was: " + peripheralTimestamp + " first value was rear: " + firstPayloadInt1 + " Side: " + firstPayloadInt2);
+                if (previousPacketIndex != -1) {
+                    currentPacketDelay = peripheralTimestamp - previouspacketTimestamp;
+                    if ((previousPacketIndex == 0 && packetIndex != 1) ||
+                            (previousPacketIndex == 1 && packetIndex != 2) ||
+                            (previousPacketIndex == 2 && packetIndex != 0)) {
+                        packetMissed = 1;
+                    } else {
+                        packetMissed = 0;
+                    }
+                }
+                previousPacketIndex = packetIndex;
+                previouspacketTimestamp = peripheralTimestamp;
+
+
+
+                //Log.i("Received data length: " + data.length, "Sensor: " + sensorIndex + " packet " + packetIndex + " read index: " + readIndex + " at time " + androidTime + " peripheral timestamp was: " + peripheralTimestamp + " first value was rear: " + firstPayloadInt1 + " Side: " + firstPayloadInt2);
+                Log.i("BLE", "packet missed: " + packetMissed + " packet delay:  " + currentPacketDelay + " Sensor: " + sensorIndex + " packet " + packetIndex + " read index: " + readIndex + " rear queue len:" + rearPacketQueueBLE.size() + " side queue len:" + sidePacketQueueBLE.size());
                 MainActivity.SensorReadingPacket packet = new MainActivity.SensorReadingPacket(sensorIndex, packetIndex, readIndex, peripheralTimestamp, androidTime, payload);
                 if (sensorIndex == 1) {
                     rearPacketQueueBLE.offer(packet);

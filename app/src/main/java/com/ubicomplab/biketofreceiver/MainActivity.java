@@ -44,6 +44,7 @@ import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.MediaStore;
+import android.telephony.TelephonyManager;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.util.Log;
@@ -65,12 +66,14 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
@@ -82,6 +85,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import com.google.android.gms.common.api.ResolvableApiException;
@@ -123,6 +127,7 @@ public class MainActivity extends AppCompatActivity {
 
     // Server communication variables.
     private static final String serverURL = "https://homes.cs.washington.edu/~joebreda/web_server/"; //"http://10.19.127.111:8080/upload";
+    private String uniqueID;
     private OkHttpClient httpUserClient = new OkHttpClient();
     private boolean cancelUpload = false;
     private int currentFileIndex = 0;
@@ -143,6 +148,7 @@ public class MainActivity extends AppCompatActivity {
     private Switch audioSwitch;
     boolean recordAudio;
     private View connectionIndicator;
+    private View labelIndicator;
     private boolean bleConnected;
     private boolean disconnectButtonPressed;
     static Button uploadDataButton;
@@ -185,6 +191,8 @@ public class MainActivity extends AppCompatActivity {
     private SensorLogger magnetometerLogger;
     private Sensor lightSensor;
     private SensorLogger lightSensorLogger;
+    private Sensor proximitySensor;
+    private SensorLogger proximitySensorLogger;
 
     private TextView textView;
     private BroadcastReceiver updateReceiver;
@@ -303,12 +311,14 @@ public class MainActivity extends AppCompatActivity {
         restartCounter++;
 
         lightSensorLogger.register(formattedDateTime);
+        proximitySensorLogger.register(formattedDateTime);
         rotationSensorLogger.register(formattedDateTime);
         accelerometerLogger.register(formattedDateTime);
         gyroscopeLogger.register(formattedDateTime);
         magnetometerLogger.register(formattedDateTime);
         audioFilePath = getExternalFilesDir(null) + "/" + formattedDateTime + "_audio.pcm";
 
+        // If using BLE logging occurs in service but transmission over serial is still using threads.
         if (overBLE) {
             Log.i("logging", "logging over ble using service now.");
         } else {
@@ -346,8 +356,8 @@ public class MainActivity extends AppCompatActivity {
             audioRecordThread.startRecording();
         }
 
+        // Location recording
         startLocationUpdates();
-
         // For logging location file (uses a different function to define thread than other writer threads).
         if (!isFileWritingThreadRunning(locationFileWritingThread)) {
             locationFileWritingThread = startStringRowFileWritingThread(
@@ -378,6 +388,7 @@ public class MainActivity extends AppCompatActivity {
         Intent serviceIntent = new Intent(this, BleService.class);
         stopService(serviceIntent);
         connectionIndicator.setBackgroundColor(Color.RED);
+        labelIndicator.setBackgroundColor(Color.BLUE);
         bleScanButton.setEnabled(true);
         bleScanButton.setText("Start Scanning");
         enableSwitchButton.setEnabled(true);
@@ -489,6 +500,7 @@ public class MainActivity extends AppCompatActivity {
                     currentFileIndex++;
                     chunksSent++;
                     Log.i("CURRENT FILE INDEX NUMBER", "" + currentFileIndex + " CHUNKS: " + chunksSent);
+                    boolean deleted = deleteFile(MainActivity.this, file.getAbsolutePath());
                     sendNextFile(); // Send the next file
                 });
             }
@@ -503,6 +515,16 @@ public class MainActivity extends AppCompatActivity {
             }
         });
     }
+
+    // Utility function to delete a file if it was successfully sent to a server.
+    public static boolean deleteFile(Context context, String filePath) {
+        File file = new File(filePath);
+        if (file.exists()) {
+            return file.delete();
+        }
+        return false;
+    }
+
 
     private void sendFileInChunks(File file, FileUploadCallback callback) {
         final long chunkSize = 1 * 1024 * 1024; // 1 MB
@@ -549,6 +571,7 @@ public class MainActivity extends AppCompatActivity {
                 .addFormDataPart("chunk_number", String.valueOf(chunkNumber))
                 .addFormDataPart("total_chunks", String.valueOf(totalChunks))
                 .addFormDataPart("file_name", originalFileName)
+                .addFormDataPart("unique_id", uniqueID)
                 .build();
 
         Request request = new Request.Builder()
@@ -606,7 +629,7 @@ public class MainActivity extends AppCompatActivity {
         @Override
         protected List<String> doInBackground(Void... voids) {
             List<String> localFileNames = getLocalCSVFiles();
-            List<String> serverFileNames = getServerFiles();
+            List<String> serverFileNames = getServerFiles(uniqueID);
 
             localFileNames.removeAll(serverFileNames); // Filter out files that are already on the server
 
@@ -643,9 +666,9 @@ public class MainActivity extends AppCompatActivity {
             return fileNames;
         }
 
-        private List<String> getServerFiles() {
+        private List<String> getServerFiles(String uniqueID) {
             OkHttpClient client = new OkHttpClient();
-            String listFilesGetURL = serverURL + "?list_files=true"; //"https://homes.cs.washington.edu/~joebreda/web_server/?list_files=true";
+            String listFilesGetURL = serverURL + "?list_files=true&unique_id=" + uniqueID;
 
             Request request = new Request.Builder()
                     .url(listFilesGetURL)
@@ -674,6 +697,7 @@ public class MainActivity extends AppCompatActivity {
 
             return new ArrayList<>();
         }
+
     }
 
     private interface FileUploadCallback {
@@ -713,6 +737,7 @@ public class MainActivity extends AppCompatActivity {
         sideSensorDataQueueSerial.clear(); // Clear the data queue
 
         lightSensorLogger.close();
+        proximitySensorLogger.close();
         rotationSensorLogger.close();
         accelerometerLogger.close();
         gyroscopeLogger.close();
@@ -767,6 +792,7 @@ public class MainActivity extends AppCompatActivity {
                 Manifest.permission.BLUETOOTH_CONNECT,
                 Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                Manifest.permission.READ_PHONE_STATE,
         };
 
         boolean allPermissionsGranted = true;
@@ -894,6 +920,12 @@ public class MainActivity extends AppCompatActivity {
                 if (this.sensorType.equals("light")) {
                     this.sensorManager.registerListener(this.sensorEventListener,
                             this.sensor, SensorManager.SENSOR_DELAY_FASTEST, sensorHandler);
+                } else if (this.sensorType.equals("proximity")) {
+                    //this.sensorManager.registerListener(this.sensorEventListener,
+                    //        this.sensor, SensorManager.SENSOR_DELAY_FASTEST, sensorHandler);
+                    this.sensorEventListener = new ProximitySensorEventListener(this.bufferedWriter);
+                    this.sensorManager.registerListener(this.sensorEventListener,
+                            this.sensor, SensorManager.SENSOR_DELAY_FASTEST, sensorHandler);
                 } else {
                     this.sensorManager.registerListener(this.sensorEventListener,
                             this.sensor, SensorManager.SENSOR_DELAY_NORMAL, sensorHandler);
@@ -951,6 +983,55 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
         }
+
+        private class ProximitySensorEventListener implements SensorEventListener {
+            private BufferedWriter writer;
+
+            public ProximitySensorEventListener(BufferedWriter writer) {
+                this.writer = writer;
+            }
+
+            @Override
+            public void onSensorChanged(SensorEvent event) {
+                if (event.sensor.getType() == Sensor.TYPE_PROXIMITY) {
+                    Log.i("PROXI", "PROXIMITY: " + event.values[0]);
+                    float label = event.values[0];
+                    if (label > 0) {
+                        labelIndicator.setBackgroundColor(Color.BLUE);
+                    } else {
+                        labelIndicator.setBackgroundColor(Color.WHITE);
+                    }
+                }
+                writeSensorDataToFile(event);
+            }
+
+            @Override
+            public void onAccuracyChanged(Sensor sensor, int accuracy) {
+                // Handle accuracy changes if needed
+            }
+
+            private void writeSensorDataToFile(SensorEvent event) {
+                try {
+                    // Prepare the data string in CSV format
+                    StringBuilder dataString = new StringBuilder();
+                    long eventTimeInMillis = (event.timestamp / 1000000L) + System.currentTimeMillis() - SystemClock.elapsedRealtime();
+
+                    dataString.append(eventTimeInMillis).append(","); // Timestamp
+
+                    // Append sensor values
+                    for (float value : event.values) {
+                        dataString.append(value).append(",");
+                    }
+                    // Remove the last comma
+                    dataString.deleteCharAt(dataString.length() - 1);
+                    // Write to file and add a new line
+                    bufferedWriter.write(dataString.toString());
+                    bufferedWriter.newLine();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
     }
 
     public boolean isBluetoothEnabled() {
@@ -970,6 +1051,44 @@ public class MainActivity extends AppCompatActivity {
         checkAndRequestPermissions();
         String testfile = getExternalFilesDir(null) + "/" + formattedDateTime + "test.csv";
         Log.i("FILEPATH:", testfile + "");
+
+        textView = (TextView) findViewById(R.id.textView);
+
+        // Write a unique id to storage for communicating with the server.
+        File phoneIdFile = new File(getExternalFilesDir(null), "phone_id.txt");
+        if (phoneIdFile.exists()) {
+            // File already exists, do not overwrite
+            Log.i("ID File", "Already exists!");
+            StringBuilder stringBuilder = new StringBuilder();
+            try (FileInputStream fis = new FileInputStream(phoneIdFile);
+                 InputStreamReader isr = new InputStreamReader(fis);
+                 BufferedReader br = new BufferedReader(isr)) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    stringBuilder.append(line);
+                }
+                uniqueID = stringBuilder.toString();
+                textView.setText(uniqueID);
+            } catch (IOException e) {
+                Log.e("MainActivity", "Error reading from file", e);
+                textView.setText("failed to read phone ID");
+                uniqueID = "-1";
+            }
+        } else {
+            // File does not exist, create and store the unique ID
+            uniqueID = UUID.randomUUID().toString();
+            try (FileOutputStream fos = new FileOutputStream(phoneIdFile)) {
+                fos.write(uniqueID.getBytes());
+                Toast.makeText(this, "Unique ID stored in " + phoneIdFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
+                textView.setText(uniqueID);
+            } catch (IOException e) {
+                Log.e("MainActivity", "Error writing to file", e);
+                Toast.makeText(this, "Failed to write to file", Toast.LENGTH_SHORT).show();
+                textView.setText("failed to create phone ID");
+                uniqueID = "-1";
+            }
+        }
+
 
         // Write logs to log file
         if (DEBUGGING_LOG_FILE) {
@@ -1001,13 +1120,15 @@ public class MainActivity extends AppCompatActivity {
 
         // Format it to a human-readable string
         formatter = DateTimeFormatter.ofPattern("dd-MM-yyyy_HH:mm:ss");
-        textView = (TextView) findViewById(R.id.textView);
 
         // Initialize the IMU sensors.
         mySensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
         lightSensor = mySensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
         lightSensorLogger = new SensorLogger(
                 mySensorManager, lightSensor, "light");
+        proximitySensor = mySensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY);
+        proximitySensorLogger = new SensorLogger(
+                mySensorManager, proximitySensor, "proximity");
         rotationSensor = mySensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
         rotationSensorLogger = new SensorLogger(
                 mySensorManager, rotationSensor, "rotation");
@@ -1073,9 +1194,14 @@ public class MainActivity extends AppCompatActivity {
         audioSwitch.setEnabled(false);
         recordAudio = false;
         connectionIndicator = findViewById(R.id.connectionIndicator);
+        labelIndicator = findViewById(R.id.labelIndicator);
+        labelIndicator.setBackgroundColor(Color.BLUE);
         bleConnected = false;
         disconnectButtonPressed = false;
         uploadDataButton = findViewById(R.id.uploadData);
+
+        bleScanButton.setBackgroundColor(Color.GREEN);
+        uploadDataButton.setBackgroundColor(Color.GREEN);
 
         audioSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
             if (isChecked) {
