@@ -37,6 +37,7 @@
         <service
             android:name=".BleService"
             android:enabled="true"
+            android:foregroundServiceType="location|connectedDevice"
             android:exported="true" />
 
         <activity

@@ -124,7 +124,7 @@ public class MainActivity extends AppCompatActivity {
     boolean DEBUGGING_LOG_FILE = false;
     // Serial logic variables.
     public static final String ACTION_USB_PERMISSION = "com.ubicomplab.biketofreceiver.USB_PERMISSION";
-
+    private Context this_context;
     // Server communication variables.
     private static final String serverURL = "https://homes.cs.washington.edu/~joebreda/web_server/"; //"http://10.19.127.111:8080/upload";
     private String uniqueID;
@@ -207,6 +207,7 @@ public class MainActivity extends AppCompatActivity {
     private AudioRecordThread audioRecordThread;
 
     private static final int MULTIPLE_PERMISSIONS_REQUEST_CODE = 123;
+    private static final int BLE_PERMISSION_REQUEST_CODE = 1;
 
     private Uri createMediaStoreUri(String fileName) {
         ContentResolver resolver = getContentResolver();
@@ -298,12 +299,10 @@ public class MainActivity extends AppCompatActivity {
         // Create a new output file to write to each time you reconnection using a global datetime.
         String rearFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_rear.csv";
         String sideFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_side.csv";
-        String locationFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_location.csv";
 
         Log.i("FILEPATH:", rearFilename + "");
         rearSensorOutputFile = new File(rearFilename);
         sideSensorOutputFile = new File(sideFilename);
-        locationOutputFile = new File(locationFilename);
 
         // TODO Instead of making an output file a more robust approach may be:
         //Uri fileUri = createMediaStoreUri("bluetooth_data.csv");
@@ -322,6 +321,8 @@ public class MainActivity extends AppCompatActivity {
         if (overBLE) {
             Log.i("logging", "logging over ble using service now.");
         } else {
+            String locationFilename = getExternalFilesDir(null) + "/" + formattedDateTime + "_location.csv";
+            locationOutputFile = new File(locationFilename);
             // Register the side and rear ToF receivers over Serial Connection.
             if (!isFileWritingThreadRunning(sideSensorFileWritingThread)) {
                 sideSensorFileWritingThread = startStringRowFileWritingThread(
@@ -332,6 +333,14 @@ public class MainActivity extends AppCompatActivity {
                 rearSensorFileWritingThread = startStringRowFileWritingThread(
                         rearSensorFileWritingThread, rearSensorDataQueueSerial,
                         rearSensorOutputFile, "rearSensorThread" + restartCounter);
+            }
+            // Location recording
+            //startLocationUpdates();
+            // For logging location file (uses a different function to define thread than other writer threads).
+            if (!isFileWritingThreadRunning(locationFileWritingThread)) {
+                locationFileWritingThread = startStringRowFileWritingThread(
+                        locationFileWritingThread, locationQueue,
+                        locationOutputFile, "locationThread" + restartCounter);
             }
         }
 
@@ -354,15 +363,6 @@ public class MainActivity extends AppCompatActivity {
 
             audioRecordThread = new AudioRecordThread(audioFilePath, audioRecord, bufferSize);
             audioRecordThread.startRecording();
-        }
-
-        // Location recording
-        startLocationUpdates();
-        // For logging location file (uses a different function to define thread than other writer threads).
-        if (!isFileWritingThreadRunning(locationFileWritingThread)) {
-            locationFileWritingThread = startStringRowFileWritingThread(
-                    locationFileWritingThread, locationQueue,
-                    locationOutputFile, "locationThread" + restartCounter);
         }
     }
 
@@ -783,6 +783,20 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == BLE_PERMISSION_REQUEST_CODE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                // Permission granted, start your Bluetooth operations
+                startScanning();
+            } else {
+                // Permission denied, handle accordingly
+                Toast.makeText(this, "Bluetooth permissions are required for scanning.", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
     private boolean checkAndRequestPermissions() {
         String[] permissions = new String[]{
                 Manifest.permission.ACCESS_COARSE_LOCATION,
@@ -1049,6 +1063,8 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        this_context = this;
+
         checkAndRequestPermissions();
         String testfile = getExternalFilesDir(null) + "/" + formattedDateTime + "test.csv";
         Log.i("FILEPATH:", testfile + "");
@@ -1239,7 +1255,23 @@ public class MainActivity extends AppCompatActivity {
 
                     } else {
                         if (isBluetoothEnabled()) {
-                            startScanning();
+                            // Check for Bluetooth permissions
+                            if (ContextCompat.checkSelfPermission(this_context, Manifest.permission.BLUETOOTH_SCAN)
+                                    != PackageManager.PERMISSION_GRANTED ||
+                                    ContextCompat.checkSelfPermission(this_context, Manifest.permission.BLUETOOTH_CONNECT)
+                                            != PackageManager.PERMISSION_GRANTED ||
+                                    ContextCompat.checkSelfPermission(this_context, Manifest.permission.BLUETOOTH_ADVERTISE)
+                                            != PackageManager.PERMISSION_GRANTED) {
+                                ActivityCompat.requestPermissions(MainActivity.this, new String[]{
+                                        Manifest.permission.BLUETOOTH_SCAN,
+                                        Manifest.permission.BLUETOOTH_CONNECT,
+                                        Manifest.permission.BLUETOOTH_ADVERTISE
+                                }, BLE_PERMISSION_REQUEST_CODE);
+                            } else {
+                                // Permissions already granted, start your Bluetooth operations
+                                startScanning();
+                            }
+
                             bleScanButton.setText("Stop Scanning");
                             uploadDataButton.setEnabled(false);
                             currentlyScanning = true;
@@ -1314,6 +1346,9 @@ public class MainActivity extends AppCompatActivity {
                     String formattedSide = String.format("%4d", sideReading);
                     String delay = String.format("%4d", sensorTime1 - sensorTime2);
                     textView.setText("Rear: " + formattedRear + " side: " + formattedSide + " Delay " + delay);
+                } else if ("com.example.ACTION_UPDATE_LOCATION_UI".equals(action)) {
+                    String locationStr = intent.getStringExtra("location");
+                    locationIndicator.setText(locationStr);
                 } else if ("com.example.ACTION_RECONNECTING".equals(action)) {
                     //bleScanButton.setBackgroundColor(Color.parseColor("#FFFF00")); // sets background color to Yellow
                     connectionIndicator.setBackgroundColor(Color.YELLOW);
@@ -1326,8 +1361,7 @@ public class MainActivity extends AppCompatActivity {
                     enableSwitchButton.setEnabled(true);
                     uploadDataButton.setEnabled(true);
                     bleConnected = false;
-                    if (!disconnectButtonPressed)
-                    stopLoggingAllSensors();
+                    if (!disconnectButtonPressed) stopLoggingAllSensors();
                 } else if ("com.example.ACTION_CONNECTED".equals(action)) {
                     connectionIndicator.setBackgroundColor(Color.GREEN);
                     bleScanButton.setText("Disconnect");
@@ -1337,6 +1371,7 @@ public class MainActivity extends AppCompatActivity {
             }
         };
         IntentFilter updateUIFilter = new IntentFilter("com.example.ACTION_UPDATE_UI");
+        updateUIFilter.addAction("com.example.ACTION_UPDATE_LOCATION_UI");
         updateUIFilter.addAction("com.example.ACTION_CONNECTED");
         updateUIFilter.addAction("com.example.ACTION_DISCONNECTED");
         updateUIFilter.addAction("com.example.ACTION_RECONNECTING");
@@ -1427,6 +1462,7 @@ public class MainActivity extends AppCompatActivity {
             formattedDateTime = now.format(formatter);
             serviceIntent.putExtra("BluetoothDevice", device);
             serviceIntent.putExtra("startTime", formattedDateTime);
+            // Starts foregrounded BLE and location service.
             startService(serviceIntent);
             startLoggingAllSensors(true, formattedDateTime);
         }
